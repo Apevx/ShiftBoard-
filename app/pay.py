@@ -213,7 +213,7 @@ def compute(period_start: date, shifts: dict, assignments: list, extras: list, o
         s = shifts.get(a["shift_id"])
         if not s or not (period_start <= d <= period_end):
             continue
-        ptype = s.get("pay_type") or "ordinary"
+        ptype = "overtime" if a.get("ot") else (s.get("pay_type") or "ordinary")
         if ptype == "unpaid":
             continue
         if s["all_day"] or not s.get("start_time"):
@@ -279,9 +279,9 @@ def compute(period_start: date, shifts: dict, assignments: list, extras: list, o
         ot_by_kind[kind] += amt
         hrs_by_kind[kind] += payable
         count_by_kind[kind] += 1
-        if kind != "ot_shift":
-            extra_out.append({"id": ref, "day": d.isoformat(), "kind": kind, "actual_hours": round(actual, 2),
-                              "paid_hours": round(payable, 2), "amount": round(amt, 2)})
+        extra_out.append({"id": ref if kind != "ot_shift" else None, "name": ref if kind == "ot_shift" else None,
+                          "day": d.isoformat(), "kind": kind, "actual_hours": round(actual, 2),
+                          "paid_hours": round(payable, 2), "amount": round(amt, 2)})
 
     # on-call: one allowance per 24 h or part (cl 10), dated by the start of each 24 h block
     oc_on = ONCALL_ON_DUTY[idx]

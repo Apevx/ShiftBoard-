@@ -72,7 +72,7 @@ main { flex: 1; padding: 0 8px; }
 .chips { display: flex; flex-direction: column; gap: 2px; }
 .chip { display: block; text-align: center; border-radius: 6px; padding: 3px 2px; font-weight: 700; font-size: 13px;
   background: var(--c); color: var(--fg, #fff); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.chips.two .chip { padding: 1px 2px; font-size: 11px; }
+.chips.multi .chip { padding: 1px 2px; font-size: 11px; }
 .ocbars { margin-top: auto; display: flex; flex-direction: column; gap: 2px; }
 .ocbar { height: 5px; background: var(--c); border-radius: 3px; }
 .ocbar.s { margin-left: 40%; } .ocbar.e { margin-right: 40%; } .ocbar.s.e { margin: 0 25%; }
@@ -165,3 +165,11 @@ button.danger { background: none; color: var(--danger); border: 1px solid color-
 body.share .owner { display: none !important; }
 body:not(.share) .share-only { display: none !important; }
 #xHours, #shiftHours { margin: -2px 0 10px; }
+
+.chip.ot { background: repeating-linear-gradient(135deg, var(--c) 0 5px, color-mix(in srgb, var(--c) 72%, #000) 5px 10px);
+  outline: 2px solid #dc2626; outline-offset: -2px; }
+.chip small { font-size: 8px; font-weight: 800; margin-left: 2px; vertical-align: 1px; }
+.tool.toggle.ot.on { background: #dc2626; border-color: #dc2626; color: #fff; }
+.otbtn { border: 1px solid var(--line) !important; border-radius: 8px; font-size: 11px !important; font-weight: 800; padding: 4px 7px !important; }
+.otbtn.on { background: #dc2626 !important; color: #fff !important; border-color: #dc2626 !important; }
+.otpill { font-size: 11px; font-weight: 700; color: #fff; background: #dc2626; border-radius: 6px; padding: 1px 6px; margin-left: 4px; vertical-align: 1px; }

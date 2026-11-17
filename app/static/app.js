@@ -19,6 +19,7 @@ let cur = new Date(); cur = new Date(cur.getFullYear(), cur.getMonth(), 1);
 let S = { shifts: [], byId: {}, assign: {}, oncall: [], notes: {}, extras: [], title: "", pay: null };
 let mode = { type: "view" };       // view | shift(id) | erase | oncall(first)
 let stack = false;                 // allow two shifts on one day
+let otMode = false;                // paint shifts as overtime
 let weekStartSun = ls.get("weekStartSun", false);
 let pattern = [];
 let openDay = null;
@@ -85,8 +86,11 @@ async function load() {
   const data = await api(SHARE ? `/api/public/${SHARE}/state${q}` : `/api/state${q}`);
   S = { ...S, ...data, notes: data.notes || {}, extras: data.extras || [] };
   S.byId = Object.fromEntries(S.shifts.map(s => [s.id, s]));
-  S.assign = {};
-  for (const a of data.assignments) (S.assign[a.day] ||= []).push(a.shift_id);
+  S.assign = {}; S.ot = new Set();
+  for (const a of data.assignments) {
+    (S.assign[a.day] ||= []).push(a.shift_id);
+    if (a.ot) S.ot.add(`${a.day}:${a.shift_id}`);
+  }
   render();
   if (!SHARE) loadPay();
 }
@@ -124,12 +128,14 @@ function render() {
     if (day === today) cls.push("today");
     if (first === day) cls.push("sel");
     const chips = ids.map(id => S.byId[id]).filter(Boolean)
-      .map(s => `<span class="chip" style="${cvars(s.color)}">${esc(s.code)}</span>`).join("");
+      .map(s => S.ot.has(`${day}:${s.id}`)
+        ? `<span class="chip ot" style="${cvars(s.color)}">${esc(s.code)}<small>OT</small></span>`
+        : `<span class="chip" style="${cvars(s.color)}">${esc(s.code)}</span>`).join("");
     const bars = oncallOn(day).slice(0, 3)
       .map(({ o, s, e }) => `<div class="ocbar${s ? " s" : ""}${e ? " e" : ""}" style="--c:${o.color}" title="${esc(o.label)}"></div>`).join("");
     html += `<div class="${cls.join(" ")}" data-day="${day}">
       <div class="num">${d.getDate()}</div>
-      <div class="chips${ids.length > 1 ? " two" : ""}">${chips}</div>
+      <div class="chips${ids.length > 1 ? " multi" : ""}">${chips}</div>
       <div class="ocbars">${bars}</div>
       ${S.notes[day] ? '<span class="notedot"></span>' : ""}
       ${xBadge(day)}
@@ -168,10 +174,11 @@ function renderPalette() {
   tools.push(`<button class="tool${mode.type === "erase" ? " on" : ""}" data-tool="erase">⌫ Erase</button>`);
   tools.push(`<button class="tool${mode.type === "oncall" ? " on" : ""}" data-tool="oncall">📟 On call</button>`);
   tools.push(`<button class="tool toggle${stack ? " on" : ""}" data-tool="stack" title="Allow two shifts on one day">2× Stack</button>`);
+  tools.push(`<button class="tool toggle ot${otMode ? " on" : ""}" data-tool="otmode" title="Paint shifts as overtime">＋ OT</button>`);
   $("#palette").innerHTML = tools.join("");
   const hints = {
     view: "Tap a day to see details",
-    shift: `Tap days to ${stack ? "add" : "set"} ${S.byId[mode.id]?.name || ""} · tap again to remove`,
+    shift: `Tap days to ${stack ? "add" : "set"} ${S.byId[mode.id]?.name || ""}${otMode ? " as overtime" : ""} · tap again to remove`,
     erase: "Tap days to clear their shifts",
     oncall: mode.first ? "Now tap the last day of the on-call period" : "Tap the first day of the on-call period",
   };
@@ -183,6 +190,7 @@ $("#palette").addEventListener("click", e => {
   const b = e.target.closest("button[data-tool]"); if (!b) return;
   const t = b.dataset.tool;
   if (t === "stack") stack = !stack;
+  else if (t === "otmode") otMode = !otMode;
   else if (t === "shift") mode = (mode.type === "shift" && mode.id === +b.dataset.id) ? { type: "view" } : { type: "shift", id: +b.dataset.id };
   else mode = (mode.type === t && t !== "view") ? { type: "view" } : { type: t, first: null };
   render();
@@ -193,28 +201,43 @@ $("#grid").addEventListener("click", e => {
   onDayTap(cell.dataset.day);
 });
 
-async function setDay(day, shiftId, action) {
-  const before = [...(S.assign[day] || [])];
-  let next = before;
-  if (action === "clear") next = [];
-  else if (action === "replace") next = [shiftId];
-  else if (action === "add") next = before.includes(shiftId) ? before : [...before, shiftId];
-  else if (action === "remove") next = before.filter(x => x !== shiftId);
-  S.assign[day] = next; render();                  // optimistic
+function setDayOt(day, ids) {
+  for (const k of [...S.ot]) if (k.startsWith(day + ":")) S.ot.delete(k);
+  for (const id of ids) S.ot.add(`${day}:${id}`);
+}
+const dayOt = day => [...S.ot].filter(k => k.startsWith(day + ":")).map(k => +k.split(":")[1]);
+
+async function setDay(day, shiftId, action, ot = false) {
+  const before = [...(S.assign[day] || [])], beforeOt = dayOt(day);
+  let next = before, nextOt = beforeOt;
+  if (action === "clear") { next = []; nextOt = []; }
+  else if (action === "replace") { next = [shiftId]; nextOt = ot ? [shiftId] : []; }
+  else if (action === "add") { next = before.includes(shiftId) ? before : [...before, shiftId]; nextOt = beforeOt.filter(x => x !== shiftId).concat(ot ? [shiftId] : []); }
+  else if (action === "set_ot") nextOt = beforeOt.filter(x => x !== shiftId).concat(ot ? [shiftId] : []);
+  else if (action === "remove") { next = before.filter(x => x !== shiftId); nextOt = beforeOt.filter(x => x !== shiftId); }
+  S.assign[day] = next; setDayOt(day, nextOt); render();     // optimistic
   try {
-    const r = await api("/api/assign", { method: "POST", body: { day, shift_id: shiftId, action } });
-    S.assign[day] = r.shift_ids;
-  } catch { S.assign[day] = before; }
+    const r = await api("/api/assign", { method: "POST", body: { day, shift_id: shiftId, action, ot } });
+    S.assign[day] = r.shift_ids; setDayOt(day, r.ot_ids);
+  } catch { S.assign[day] = before; setDayOt(day, beforeOt); }
   render();
   if (openDay === day) renderDay();
+  loadPay();
+}
+
+/* tap a shift onto a day: same shift+same OT state removes it, different OT state flips it */
+function paintShift(day, id, asOt) {
+  const has = (S.assign[day] || []).includes(id);
+  if (has) {
+    const isOt = S.ot.has(`${day}:${id}`);
+    return isOt === asOt ? setDay(day, id, "remove") : setDay(day, id, "set_ot", asOt);
+  }
+  return setDay(day, id, stack ? "add" : "replace", asOt);
 }
 
 function onDayTap(day) {
   if (SHARE || mode.type === "view") return showDay(day);
-  if (mode.type === "shift") {
-    const has = (S.assign[day] || []).includes(mode.id);
-    return setDay(day, mode.id, has ? "remove" : (stack ? "add" : "replace"));
-  }
+  if (mode.type === "shift") return paintShift(day, mode.id, otMode);
   if (mode.type === "erase") return (S.assign[day] || []).length && setDay(day, null, "clear");
   if (mode.type === "oncall") {
     if (!mode.first) { mode.first = day; return render(); }
@@ -252,9 +275,11 @@ function renderDay() {
   const ids = sortIds(S.assign[day] || []);
   $("#dayShifts").innerHTML = ids.length ? ids.map(id => {
     const s = S.byId[id]; if (!s) return "";
+    const ot = S.ot.has(`${day}:${id}`);
     return `<div class="item"><span class="sw" style="${cvars(s.color)}">${esc(s.code)}</span>
-      <div class="grow"><div class="t">${esc(s.name)}</div><div class="s">${shiftTimes(s)}</div></div>
-      ${SHARE ? "" : `<button data-rm="${id}" aria-label="Remove">✕</button>`}</div>`;
+      <div class="grow"><div class="t">${esc(s.name)}${ot ? ' <span class="otpill">Overtime</span>' : ""}</div><div class="s">${shiftTimes(s)}</div></div>
+      ${SHARE ? "" : `<button class="otbtn${ot ? " on" : ""}" data-ot="${id}" title="Mark as overtime">OT</button>
+      <button data-rm="${id}" aria-label="Remove">✕</button>`}</div>`;
   }).join("") : `<div class="muted">${SHARE ? "Not working" : "No shift"}</div>`;
 
   $("#dayPicker").innerHTML = activeShifts().map(s =>
@@ -344,7 +369,9 @@ async function showPay() {
   const pd = p.penalty_detail || {};
   const pen = [["shift", "Shift allowance"], ["saturday", "Saturday"], ["sunday", "Sunday"], ["holiday", "Public holiday"]]
     .filter(([k]) => pd[k]).map(([k, l]) => `<tr class="sub"><td>${l}</td><td class="r">${money(pd[k], true)}</td></tr>`).join("");
-  const xs = (p.extras || []).map(x => `<tr class="sub"><td>${fmtDay(x.day)} · ${XKIND[x.kind]} ${fmtHours(x.actual_hours)}h${x.paid_hours > x.actual_hours ? ` (paid ${fmtHours(x.paid_hours)}h)` : ""}</td><td class="r">${money(x.amount, true)}</td></tr>`).join("");
+  const xrow = x => `<tr class="sub"><td>${fmtDay(x.day)} · ${x.kind === "ot_shift" ? esc(x.name) + " shift" : XKIND[x.kind]} ${fmtHours(x.actual_hours)}h${x.paid_hours > x.actual_hours ? ` (paid ${fmtHours(x.paid_hours)}h)` : ""}</td><td class="r">${money(x.amount, true)}</td></tr>`;
+  const otx = (p.extras || []).filter(x => x.kind === "ot_shift" || x.kind === "overtime").sort((a, b) => a.day < b.day ? -1 : 1).map(xrow).join("");
+  const xs = (p.extras || []).filter(x => x.kind === "callin" || x.kind === "remote").map(xrow).join("");
   const hol = Object.entries(p.holidays || {}).map(([d, n]) => `${fmtDay(d)} ${esc(n)}`).join(", ");
   $("#payBody").innerHTML = `
     <p class="muted small">${esc(p.rate_label)} · ${money(p.hourly, true)}/h</p>
@@ -352,7 +379,7 @@ async function showPay() {
       ${row("Ordinary hours", `${fmtHours(p.ordinary_hours)} of ${p.contract_hours} h rostered`, p.ordinary_pay)}
       ${row("Penalties", "", p.penalties)}${pen}
       ${p.leave_hours ? row("Paid leave", `${fmtHours(p.leave_hours)} h`, p.leave_pay) : ""}
-      ${row("Overtime", `${fmtHours(p.overtime_hours)} h`, p.overtime_pay)}
+      ${row("Overtime", `${fmtHours(p.overtime_hours)} h`, p.overtime_pay)}${otx}
       ${row(`Called in / recall ×${p.callin_count}`, `${fmtHours(p.callin_hours)} h paid`, p.callin_pay)}
       ${xs}
       ${row(`On call ×${p.oncall_count}`, `${fmtHours(p.oncall_hours)} h on call · ${money(p.oncall_rates.on_duty, true)} rostered on / ${money(p.oncall_rates.off_duty, true)} off`, p.oncall_pay)}
@@ -365,12 +392,13 @@ async function showPay() {
 $("#payPrev").onclick = () => { payOn = ymd(addDays(parseYmd(payOn), -14)); showPay(); };
 $("#payNext").onclick = () => { payOn = ymd(addDays(parseYmd(payOn), 14)); showPay(); };
 $("#dayShifts").addEventListener("click", e => {
-  const b = e.target.closest("[data-rm]"); if (b) setDay(openDay, +b.dataset.rm, "remove");
+  const b = e.target.closest("[data-rm]"); if (b) return setDay(openDay, +b.dataset.rm, "remove");
+  const o = e.target.closest("[data-ot]");
+  if (o) { const id = +o.dataset.ot; setDay(openDay, id, "set_ot", !S.ot.has(`${openDay}:${id}`)); }
 });
 $("#dayPicker").addEventListener("click", e => {
   const b = e.target.closest("button[data-id]"); if (!b) return;
-  const id = +b.dataset.id, has = (S.assign[openDay] || []).includes(id);
-  setDay(openDay, id, has ? "remove" : (stack ? "add" : "replace"));
+  paintShift(openDay, +b.dataset.id, otMode);
 });
 $("#dayOncall").addEventListener("click", e => {
   const it = e.target.closest("[data-oc]"); if (!it) return;

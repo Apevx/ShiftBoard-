@@ -16,6 +16,7 @@ Then open `http://<homelab-ip>:8085`. Data is stored in `./data/shiftboard.db` (
 ## Using it
 
 - **Paint shifts:** pick a shift in the bottom bar, then tap days. Tap a day again to remove the shift. **Erase** clears a day. Turn on **2× Stack** to put two shifts on one day (e.g. a double).
+- **Overtime shifts:** turn on **＋ OT** in the bottom bar and any shift you paint is marked as overtime (striped with a red outline). Combine with Stack to add an overtime shift on top of your rostered one. Tapping a shift onto a day that already has it with the other OT setting flips it. You can also tap **OT** next to a shift in the day sheet.
 - **View mode:** tap a day to see times, set or change its shift, see on-call, and add a private note.
 - **On call:** pick **On call**, tap the first day, then tap the last day. Set the times (it remembers your last ones, e.g. 17:00 → 08:00) and save. It shows as an amber bar under each day it covers. You can also add on-call from the day sheet.
 - **Rotation (Settings → Rotation):** build a repeating pattern such as `D D N N – – – –` and apply it to a date range. You can still tweak individual days afterwards.

@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS shifts(
 CREATE TABLE IF NOT EXISTS assignments(
   day TEXT NOT NULL,
   shift_id INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+  ot INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(day, shift_id)
 );
 CREATE TABLE IF NOT EXISTS oncall(
@@ -111,6 +112,8 @@ def init_db():
     with db() as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(SCHEMA)
+        if "ot" not in {r[1] for r in c.execute("PRAGMA table_info(assignments)")}:
+            c.execute("ALTER TABLE assignments ADD COLUMN ot INTEGER NOT NULL DEFAULT 0")
         cols = {r[1] for r in c.execute("PRAGMA table_info(shifts)")}
         if "pay_type" not in cols:  # migrate databases from before pay tracking
             c.execute("ALTER TABLE shifts ADD COLUMN pay_type TEXT NOT NULL DEFAULT 'ordinary'")
@@ -216,7 +219,7 @@ def load_state(c, start: date, end: date, public: bool) -> dict:
     assignments = [
         dict(r)
         for r in c.execute(
-            "SELECT day, shift_id FROM assignments WHERE day BETWEEN ? AND ? ORDER BY day",
+            "SELECT day, shift_id, ot FROM assignments WHERE day BETWEEN ? AND ? ORDER BY day",
             (start.isoformat(), end.isoformat()),
         )
     ]
@@ -358,11 +361,16 @@ def reorder(body: OrderIn):
 class AssignIn(BaseModel):
     day: date
     shift_id: Optional[int] = None
-    action: Literal["add", "replace", "remove", "clear"] = "replace"
+    action: Literal["add", "replace", "remove", "clear", "set_ot"] = "replace"
+    ot: bool = False
 
 
 def _day_ids(c, day: str) -> list[int]:
     return [r[0] for r in c.execute("SELECT shift_id FROM assignments WHERE day=?", (day,))]
+
+
+def _day_ot(c, day: str) -> list[int]:
+    return [r[0] for r in c.execute("SELECT shift_id FROM assignments WHERE day=? AND ot=1", (day,))]
 
 
 @app.post("/api/assign", dependencies=[Depends(require_auth)])
@@ -374,10 +382,16 @@ def assign(a: AssignIn):
         if a.action in ("add", "replace"):
             if a.shift_id is None:
                 raise HTTPException(400, "shift_id required")
-            c.execute("INSERT OR IGNORE INTO assignments(day, shift_id) VALUES(?,?)", (day, a.shift_id))
+            c.execute(
+                "INSERT INTO assignments(day, shift_id, ot) VALUES(?,?,?) "
+                "ON CONFLICT(day, shift_id) DO UPDATE SET ot=excluded.ot",
+                (day, a.shift_id, int(a.ot)),
+            )
+        if a.action == "set_ot":
+            c.execute("UPDATE assignments SET ot=? WHERE day=? AND shift_id=?", (int(a.ot), day, a.shift_id))
         if a.action == "remove":
             c.execute("DELETE FROM assignments WHERE day=? AND shift_id=?", (day, a.shift_id))
-        return {"day": day, "shift_ids": _day_ids(c, day)}
+        return {"day": day, "shift_ids": _day_ids(c, day), "ot_ids": _day_ot(c, day)}
 
 
 class PatternIn(BaseModel):
@@ -571,7 +585,7 @@ def get_pay(on: Optional[date] = None):
         end = start + timedelta(days=13)
         shifts = {r["id"]: dict(r) for r in c.execute("SELECT * FROM shifts")}
         assignments = [dict(r) for r in c.execute(
-            "SELECT day, shift_id FROM assignments WHERE day BETWEEN ? AND ?", (start.isoformat(), end.isoformat()))]
+            "SELECT day, shift_id, ot FROM assignments WHERE day BETWEEN ? AND ?", (start.isoformat(), end.isoformat()))]
         extras = [dict(r) for r in c.execute(
             "SELECT * FROM extras WHERE day BETWEEN ? AND ?", (start.isoformat(), end.isoformat()))]
         hi = f"{(end + timedelta(days=1)).isoformat()}T00:00"
@@ -663,7 +677,8 @@ def ics_feed(token: str):
             if end <= start:
                 end += timedelta(days=1)
             ev += [f"DTSTART:{_utc(start)}", f"DTEND:{_utc(end)}", "TRANSP:OPAQUE"]
-        ev += [f"SUMMARY:{_esc(s['name'])}", "CATEGORIES:Shift", "END:VEVENT"]
+        name = s["name"] + (" (overtime)" if a.get("ot") else "")
+        ev += [f"SUMMARY:{_esc(name)}", "CATEGORIES:Shift", "END:VEVENT"]
         lines += ev
     for o in st["oncall"]:
         lines += [
