@@ -1,0 +1,16 @@
+services:
+  shiftboard:
+    image: ghcr.io/apevx/shiftboard:latest
+    container_name: shiftboard
+    restart: unless-stopped
+    ports:
+      - "8085:8080"
+    environment:
+      TZ: Australia/Sydney
+      # Protects editing. Share links / calendar feed stay public (read-only).
+      ADMIN_PASSWORD: change-me
+      # Optional: the public address people outside your LAN will use, e.g. https://shifts.example.com
+      # PUBLIC_URL: https://shifts.example.com
+      APP_TITLE: My Shifts
+    volumes:
+      - ./data:/data

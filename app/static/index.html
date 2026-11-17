@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0f172a">
+<title>Shiftboard</title>
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="title-row">
+    <h1 id="title">Shiftboard</h1>
+    <div class="top-actions">
+      <button class="icon" id="todayBtn" title="Today">Today</button>
+      <button class="icon owner" id="settingsBtn" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7Zm7.43-2.53a7.8 7.8 0 0 0 0-1.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.4 7.4 0 0 0-1.68-.97l-.36-2.54A.5.5 0 0 0 14.13 2h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.6.24-1.17.57-1.68.97l-2.39-.96a.5.5 0 0 0-.6.22L2.84 8.51a.5.5 0 0 0 .12.64l2.03 1.58a7.8 7.8 0 0 0 0 1.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.13.22.39.3.6.22l2.39-.96c.51.4 1.08.73 1.68.97l.36 2.54c.04.24.25.42.5.42h3.84c.25 0 .46-.18.5-.42l.36-2.54c.6-.24 1.17-.57 1.68-.97l2.39.96c.22.08.47 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58Z"/></svg>
+      </button>
+      <a class="icon share-only" id="subscribeTop" href="#">Subscribe</a>
+    </div>
+  </div>
+  <div class="month-row">
+    <button class="nav" id="prevBtn" aria-label="Previous month">‹</button>
+    <div class="month-label" id="monthLabel"></div>
+    <button class="nav" id="nextBtn" aria-label="Next month">›</button>
+  </div>
+  <div class="summary" id="summary"></div>
+</header>
+
+<main>
+  <div class="weekdays" id="weekdays"></div>
+  <div class="grid" id="grid"></div>
+</main>
+
+<footer class="palette owner" id="paletteWrap">
+  <div class="hint" id="hint">Tap a day to see details</div>
+  <div class="palette-row" id="palette"></div>
+</footer>
+
+<!-- Day sheet -->
+<dialog id="dayDlg" class="sheet">
+  <form method="dialog" class="sheet-head"><h2 id="dayTitle"></h2><button class="x" aria-label="Close">✕</button></form>
+  <div class="sheet-body">
+    <section id="dayShifts"></section>
+    <section class="owner">
+      <div class="label">Set shift</div>
+      <div class="chip-picker" id="dayPicker"></div>
+    </section>
+    <section>
+      <div class="label row">On call <button class="link owner" id="dayAddOncall">+ Add</button></div>
+      <div id="dayOncall"></div>
+    </section>
+    <section class="owner">
+      <div class="label">Note <span class="muted">(private)</span></div>
+      <textarea id="dayNote" rows="3" placeholder="Swap with Sam, training, etc."></textarea>
+    </section>
+  </div>
+</dialog>
+
+<!-- On-call editor -->
+<dialog id="ocDlg" class="sheet">
+  <form method="dialog" class="sheet-head"><h2 id="ocTitle">On call</h2><button class="x" aria-label="Close">✕</button></form>
+  <form class="sheet-body form" id="ocForm">
+    <label>Label <input name="label" maxlength="40" required></label>
+    <div class="two">
+      <label>Starts <input type="date" name="sd" required></label>
+      <label>&nbsp;<input type="time" name="st" required></label>
+    </div>
+    <div class="two">
+      <label>Ends <input type="date" name="ed" required></label>
+      <label>&nbsp;<input type="time" name="et" required></label>
+    </div>
+    <label>Colour <input type="color" name="color"></label>
+    <label>Note <span class="muted">(private)</span><textarea name="note" rows="2"></textarea></label>
+    <div class="actions">
+      <button type="button" class="danger" id="ocDelete">Delete</button>
+      <span class="spacer"></span>
+      <button type="submit" class="primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Shift editor -->
+<dialog id="shiftDlg" class="sheet">
+  <form method="dialog" class="sheet-head"><h2 id="shiftTitle">Shift</h2><button class="x" aria-label="Close">✕</button></form>
+  <form class="sheet-body form" id="shiftForm">
+    <div class="two">
+      <label>Name <input name="name" maxlength="40" required placeholder="Day"></label>
+      <label>Code <input name="code" maxlength="4" required placeholder="D"></label>
+    </div>
+    <label class="check"><input type="checkbox" name="all_day"> All day (leave, off, training…)</label>
+    <div class="two times">
+      <label>Start <input type="time" name="start_time"></label>
+      <label>End <input type="time" name="end_time"></label>
+    </div>
+    <div class="muted small" id="shiftHours"></div>
+    <label>Colour <input type="color" name="color"></label>
+    <div class="swatches" id="swatches"></div>
+    <div class="actions">
+      <button type="button" class="danger" id="shiftDelete">Delete</button>
+      <span class="spacer"></span>
+      <button type="submit" class="primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Settings -->
+<dialog id="setDlg" class="sheet wide">
+  <form method="dialog" class="sheet-head"><h2>Settings</h2><button class="x" aria-label="Close">✕</button></form>
+  <nav class="tabs" id="tabs">
+    <button data-tab="shifts" class="on">Shifts</button>
+    <button data-tab="rotation">Rotation</button>
+    <button data-tab="share">Share</button>
+    <button data-tab="general">General</button>
+  </nav>
+  <div class="sheet-body">
+    <section data-pane="shifts">
+      <div id="shiftList"></div>
+      <button class="primary block" id="newShift">+ New shift</button>
+      <p class="muted small">Use the arrows to reorder the palette. Deleting a shift that's already on the calendar just hides it from the palette.</p>
+    </section>
+
+    <section data-pane="rotation" hidden>
+      <p class="muted small">Build a repeating roster (e.g. D D N N off off off off) and stamp it onto a date range.</p>
+      <div class="label">Pattern <span class="muted" id="patLen"></span></div>
+      <div class="pattern" id="patSeq"><span class="muted">Tap shifts below to add days</span></div>
+      <div class="chip-picker" id="patPicker"></div>
+      <div class="row gap">
+        <button class="ghost" id="patUndo">Undo</button>
+        <button class="ghost" id="patClear">Clear</button>
+      </div>
+      <div class="form">
+        <div class="two">
+          <label>From <input type="date" id="patStart"></label>
+          <label>Until <input type="date" id="patEnd"></label>
+        </div>
+        <label class="check"><input type="checkbox" id="patReplace" checked> Replace existing shifts in this range</label>
+        <button class="primary block" id="patApply">Apply rotation</button>
+        <button class="ghost block" id="clearRange">Clear all shifts in this range</button>
+      </div>
+    </section>
+
+    <section data-pane="share" hidden>
+      <p>Anyone with these links can <b>view</b> your shifts and on-call (notes stay private).</p>
+      <div class="label">Web page</div>
+      <div class="copy"><input readonly id="shareUrl"><button class="ghost" data-copy="shareUrl">Copy</button></div>
+      <div class="label">Calendar feed (Google, Apple, Outlook, Home Assistant)</div>
+      <div class="copy"><input readonly id="icsUrl"><button class="ghost" data-copy="icsUrl">Copy</button></div>
+      <a class="primary block center" id="webcalLink" href="#">Subscribe on this device</a>
+      <p class="muted small" id="shareWarn"></p>
+      <button class="danger block" id="rotateShare">Reset links (old ones stop working)</button>
+    </section>
+
+    <section data-pane="general" hidden>
+      <form class="form" id="genForm">
+        <label>Calendar name <input name="title" maxlength="60" required></label>
+        <label class="check"><input type="checkbox" id="weekStartSun"> Week starts on Sunday</label>
+        <button class="primary" type="submit">Save</button>
+      </form>
+      <button class="ghost block" id="logoutBtn">Log out</button>
+    </section>
+  </div>
+</dialog>
+
+<!-- Login -->
+<div class="login" id="login" hidden>
+  <form id="loginForm">
+    <h2>Shiftboard</h2>
+    <input type="password" name="password" placeholder="Password" autocomplete="current-password" required autofocus>
+    <button class="primary block" type="submit">Log in</button>
+  </form>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

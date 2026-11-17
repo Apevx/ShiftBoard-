@@ -1,0 +1,567 @@
+"""Shiftboard — a tiny self-hosted shift calendar.
+
+FastAPI + SQLite. Serves a single-page UI, a read-only share page and an
+iCalendar (.ics) feed that phones / Google / Outlook / Home Assistant can subscribe to.
+"""
+import hashlib
+import hmac
+import os
+import secrets
+import sqlite3
+from contextlib import contextmanager
+from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
+from typing import Literal, Optional
+from zoneinfo import ZoneInfo
+
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+DB_PATH = os.environ.get("DB_PATH", "/data/shiftboard.db")
+TZ_NAME = os.environ.get("TZ", "Australia/Sydney")
+TZ = ZoneInfo(TZ_NAME)
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
+STATIC = Path(__file__).parent / "static"
+COOKIE = "sb_session"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS shifts(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  code TEXT NOT NULL,
+  color TEXT NOT NULL DEFAULT '#3b82f6',
+  all_day INTEGER NOT NULL DEFAULT 0,
+  start_time TEXT,
+  end_time TEXT,
+  sort INTEGER NOT NULL DEFAULT 0,
+  archived INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS assignments(
+  day TEXT NOT NULL,
+  shift_id INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+  PRIMARY KEY(day, shift_id)
+);
+CREATE TABLE IF NOT EXISTS oncall(
+  id INTEGER PRIMARY KEY,
+  label TEXT NOT NULL DEFAULT 'On call',
+  start TEXT NOT NULL,
+  end TEXT NOT NULL,
+  color TEXT NOT NULL DEFAULT '#f59e0b',
+  note TEXT
+);
+CREATE TABLE IF NOT EXISTS notes(day TEXT PRIMARY KEY, text TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE INDEX IF NOT EXISTS idx_oncall_range ON oncall(start, end);
+"""
+
+DEFAULT_SHIFTS = [
+    ("Day", "D", "#3b82f6", 0, "07:00", "15:30"),
+    ("Afternoon", "A", "#8b5cf6", 0, "15:00", "23:30"),
+    ("Night", "N", "#1e3a8a", 0, "23:00", "07:30"),
+    ("Leave", "L", "#16a34a", 1, None, None),
+]
+
+
+@contextmanager
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_setting(c, key, default=None):
+    row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(c, key, value):
+    c.execute(
+        "INSERT INTO settings(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
+def init_db():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    with db() as c:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.executescript(SCHEMA)
+        if get_setting(c, "secret") is None:
+            set_setting(c, "secret", secrets.token_hex(32))
+        if get_setting(c, "share_token") is None:
+            set_setting(c, "share_token", secrets.token_urlsafe(18))
+        if get_setting(c, "title") is None:
+            set_setting(c, "title", os.environ.get("APP_TITLE", "My Shifts"))
+        if get_setting(c, "seeded") is None:
+            for i, s in enumerate(DEFAULT_SHIFTS):
+                c.execute(
+                    "INSERT INTO shifts(name,code,color,all_day,start_time,end_time,sort) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (*s, i),
+                )
+            set_setting(c, "seeded", "1")
+
+
+init_db()
+with db() as _c:
+    SECRET = get_setting(_c, "secret")
+
+app = FastAPI(title="Shiftboard", docs_url=None, redoc_url=None)
+app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+
+# ---------------------------------------------------------------- auth
+def _session_value() -> str:
+    msg = ("admin:" + ADMIN_PASSWORD).encode()
+    return hmac.new(SECRET.encode(), msg, hashlib.sha256).hexdigest()
+
+
+def is_authed(request: Request) -> bool:
+    if not ADMIN_PASSWORD:
+        return True
+    return hmac.compare_digest(request.cookies.get(COOKIE, "").encode(), _session_value().encode())
+
+
+def require_auth(request: Request):
+    if not is_authed(request):
+        raise HTTPException(401, "Login required")
+
+
+class LoginIn(BaseModel):
+    password: str
+
+
+@app.get("/api/me")
+def me(request: Request):
+    return {"auth_required": bool(ADMIN_PASSWORD), "authed": is_authed(request)}
+
+
+@app.post("/api/login")
+def login(body: LoginIn, response: Response):
+    if ADMIN_PASSWORD and not hmac.compare_digest(body.password.encode(), ADMIN_PASSWORD.encode()):
+        raise HTTPException(401, "Wrong password")
+    response.set_cookie(COOKIE, _session_value(), max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
+    return {"ok": True}
+
+
+@app.post("/api/logout")
+def logout(response: Response):
+    response.delete_cookie(COOKIE)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- helpers
+HHMM = r"^([01]\d|2[0-3]):[0-5]\d$"
+LOCAL_DT = r"^\d{4}-\d{2}-\d{2}T([01]\d|2[0-3]):[0-5]\d$"
+COLOR = r"^#[0-9a-fA-F]{6}$"
+
+
+def shift_hours(row) -> float:
+    if row["all_day"] or not row["start_time"] or not row["end_time"]:
+        return 0.0
+    sh, sm = map(int, row["start_time"].split(":"))
+    eh, em = map(int, row["end_time"].split(":"))
+    mins = ((eh * 60 + em) - (sh * 60 + sm)) % 1440 or 1440
+    return round(mins / 60, 2)
+
+
+def shift_dict(r) -> dict:
+    d = dict(r)
+    d["all_day"] = bool(d["all_day"])
+    d["archived"] = bool(d["archived"])
+    d["hours"] = shift_hours(r)
+    return d
+
+
+def check_range(start: date, end: date):
+    if end < start or (end - start).days > 800:
+        raise HTTPException(400, "Bad date range")
+
+
+def load_state(c, start: date, end: date, public: bool) -> dict:
+    check_range(start, end)
+    shifts = [shift_dict(r) for r in c.execute("SELECT * FROM shifts ORDER BY archived, sort, id")]
+    assignments = [
+        dict(r)
+        for r in c.execute(
+            "SELECT day, shift_id FROM assignments WHERE day BETWEEN ? AND ? ORDER BY day",
+            (start.isoformat(), end.isoformat()),
+        )
+    ]
+    range_start = f"{start.isoformat()}T00:00"
+    range_end = f"{(end + timedelta(days=1)).isoformat()}T00:00"
+    oncall = [
+        dict(r)
+        for r in c.execute(
+            "SELECT * FROM oncall WHERE start < ? AND end > ? ORDER BY start", (range_end, range_start)
+        )
+    ]
+    out = {
+        "title": get_setting(c, "title"),
+        "shifts": shifts,
+        "assignments": assignments,
+        "oncall": oncall,
+    }
+    if public:
+        for o in out["oncall"]:
+            o.pop("note", None)
+    else:
+        out["notes"] = {
+            r["day"]: r["text"]
+            for r in c.execute(
+                "SELECT day, text FROM notes WHERE day BETWEEN ? AND ?", (start.isoformat(), end.isoformat())
+            )
+        }
+        out["share_token"] = get_setting(c, "share_token")
+        out["public_url"] = PUBLIC_URL
+        out["auth_required"] = bool(ADMIN_PASSWORD)
+    return out
+
+
+def check_token(c, token: str):
+    real = get_setting(c, "share_token") or ""
+    if not hmac.compare_digest(token.encode(), real.encode()):
+        raise HTTPException(404, "Not found")
+
+
+# ---------------------------------------------------------------- state
+@app.get("/api/state", dependencies=[Depends(require_auth)])
+def state(start: date, end: date):
+    with db() as c:
+        return load_state(c, start, end, public=False)
+
+
+@app.get("/api/public/{token}/state")
+def public_state(token: str, start: date, end: date):
+    with db() as c:
+        check_token(c, token)
+        return load_state(c, start, end, public=True)
+
+
+# ---------------------------------------------------------------- shifts
+class ShiftIn(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    code: str = Field(min_length=1, max_length=4)
+    color: str = Field(pattern=COLOR)
+    all_day: bool = False
+    start_time: Optional[str] = Field(default=None, pattern=HHMM)
+    end_time: Optional[str] = Field(default=None, pattern=HHMM)
+    archived: bool = False
+
+
+def _validate_shift(s: ShiftIn):
+    if not s.all_day and (not s.start_time or not s.end_time):
+        raise HTTPException(400, "Timed shifts need a start and end time")
+    if s.all_day:
+        s.start_time = s.end_time = None
+
+
+@app.post("/api/shifts", dependencies=[Depends(require_auth)])
+def create_shift(s: ShiftIn):
+    _validate_shift(s)
+    with db() as c:
+        sort = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM shifts").fetchone()[0]
+        cur = c.execute(
+            "INSERT INTO shifts(name,code,color,all_day,start_time,end_time,sort) VALUES(?,?,?,?,?,?,?)",
+            (s.name.strip(), s.code.strip(), s.color, int(s.all_day), s.start_time, s.end_time, sort),
+        )
+        return shift_dict(c.execute("SELECT * FROM shifts WHERE id=?", (cur.lastrowid,)).fetchone())
+
+
+@app.put("/api/shifts/{sid}", dependencies=[Depends(require_auth)])
+def update_shift(sid: int, s: ShiftIn):
+    _validate_shift(s)
+    with db() as c:
+        cur = c.execute(
+            "UPDATE shifts SET name=?,code=?,color=?,all_day=?,start_time=?,end_time=?,archived=? WHERE id=?",
+            (s.name.strip(), s.code.strip(), s.color, int(s.all_day), s.start_time, s.end_time, int(s.archived), sid),
+        )
+        if not cur.rowcount:
+            raise HTTPException(404, "Shift not found")
+        return shift_dict(c.execute("SELECT * FROM shifts WHERE id=?", (sid,)).fetchone())
+
+
+@app.delete("/api/shifts/{sid}", dependencies=[Depends(require_auth)])
+def delete_shift(sid: int):
+    """Shifts already on the calendar are archived (hidden from the palette) so history survives."""
+    with db() as c:
+        used = c.execute("SELECT COUNT(*) FROM assignments WHERE shift_id=?", (sid,)).fetchone()[0]
+        if used:
+            c.execute("UPDATE shifts SET archived=1 WHERE id=?", (sid,))
+            return {"archived": True, "used": used}
+        c.execute("DELETE FROM shifts WHERE id=?", (sid,))
+        return {"deleted": True}
+
+
+class OrderIn(BaseModel):
+    ids: list[int]
+
+
+@app.put("/api/shifts-order", dependencies=[Depends(require_auth)])
+def reorder(body: OrderIn):
+    with db() as c:
+        for i, sid in enumerate(body.ids):
+            c.execute("UPDATE shifts SET sort=? WHERE id=?", (i, sid))
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- assignments
+class AssignIn(BaseModel):
+    day: date
+    shift_id: Optional[int] = None
+    action: Literal["add", "replace", "remove", "clear"] = "replace"
+
+
+def _day_ids(c, day: str) -> list[int]:
+    return [r[0] for r in c.execute("SELECT shift_id FROM assignments WHERE day=?", (day,))]
+
+
+@app.post("/api/assign", dependencies=[Depends(require_auth)])
+def assign(a: AssignIn):
+    day = a.day.isoformat()
+    with db() as c:
+        if a.action in ("clear", "replace"):
+            c.execute("DELETE FROM assignments WHERE day=?", (day,))
+        if a.action in ("add", "replace"):
+            if a.shift_id is None:
+                raise HTTPException(400, "shift_id required")
+            c.execute("INSERT OR IGNORE INTO assignments(day, shift_id) VALUES(?,?)", (day, a.shift_id))
+        if a.action == "remove":
+            c.execute("DELETE FROM assignments WHERE day=? AND shift_id=?", (day, a.shift_id))
+        return {"day": day, "shift_ids": _day_ids(c, day)}
+
+
+class PatternIn(BaseModel):
+    start: date
+    end: date
+    pattern: list[Optional[int]] = Field(min_length=1, max_length=366)
+    replace: bool = True
+
+
+@app.post("/api/pattern", dependencies=[Depends(require_auth)])
+def apply_pattern(p: PatternIn):
+    """Repeat a rotation (list of shift ids, null = day off) from start to end inclusive."""
+    check_range(p.start, p.end)
+    n = 0
+    with db() as c:
+        d = p.start
+        while d <= p.end:
+            sid = p.pattern[(d - p.start).days % len(p.pattern)]
+            iso = d.isoformat()
+            if p.replace:
+                c.execute("DELETE FROM assignments WHERE day=?", (iso,))
+            if sid is not None:
+                c.execute("INSERT OR IGNORE INTO assignments(day, shift_id) VALUES(?,?)", (iso, sid))
+                n += 1
+            d += timedelta(days=1)
+    return {"assigned": n}
+
+
+class RangeIn(BaseModel):
+    start: date
+    end: date
+
+
+@app.post("/api/clear", dependencies=[Depends(require_auth)])
+def clear_range(r: RangeIn):
+    check_range(r.start, r.end)
+    with db() as c:
+        cur = c.execute(
+            "DELETE FROM assignments WHERE day BETWEEN ? AND ?", (r.start.isoformat(), r.end.isoformat())
+        )
+        return {"removed": cur.rowcount}
+
+
+# ---------------------------------------------------------------- notes
+class NoteIn(BaseModel):
+    text: str = Field(max_length=2000)
+
+
+@app.put("/api/notes/{day}", dependencies=[Depends(require_auth)])
+def put_note(day: date, n: NoteIn):
+    with db() as c:
+        if n.text.strip():
+            c.execute(
+                "INSERT INTO notes(day,text) VALUES(?,?) ON CONFLICT(day) DO UPDATE SET text=excluded.text",
+                (day.isoformat(), n.text),
+            )
+        else:
+            c.execute("DELETE FROM notes WHERE day=?", (day.isoformat(),))
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- on-call
+class OnCallIn(BaseModel):
+    label: str = Field(default="On call", min_length=1, max_length=40)
+    start: str = Field(pattern=LOCAL_DT)
+    end: str = Field(pattern=LOCAL_DT)
+    color: str = Field(default="#f59e0b", pattern=COLOR)
+    note: Optional[str] = Field(default=None, max_length=1000)
+
+
+def _validate_oncall(o: OnCallIn):
+    if o.end <= o.start:
+        raise HTTPException(400, "On-call must end after it starts")
+
+
+@app.post("/api/oncall", dependencies=[Depends(require_auth)])
+def create_oncall(o: OnCallIn):
+    _validate_oncall(o)
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO oncall(label,start,end,color,note) VALUES(?,?,?,?,?)",
+            (o.label.strip(), o.start, o.end, o.color, o.note),
+        )
+        return dict(c.execute("SELECT * FROM oncall WHERE id=?", (cur.lastrowid,)).fetchone())
+
+
+@app.put("/api/oncall/{oid}", dependencies=[Depends(require_auth)])
+def update_oncall(oid: int, o: OnCallIn):
+    _validate_oncall(o)
+    with db() as c:
+        cur = c.execute(
+            "UPDATE oncall SET label=?,start=?,end=?,color=?,note=? WHERE id=?",
+            (o.label.strip(), o.start, o.end, o.color, o.note, oid),
+        )
+        if not cur.rowcount:
+            raise HTTPException(404, "Not found")
+        return dict(c.execute("SELECT * FROM oncall WHERE id=?", (oid,)).fetchone())
+
+
+@app.delete("/api/oncall/{oid}", dependencies=[Depends(require_auth)])
+def delete_oncall(oid: int):
+    with db() as c:
+        c.execute("DELETE FROM oncall WHERE id=?", (oid,))
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- settings / sharing
+class SettingsIn(BaseModel):
+    title: str = Field(min_length=1, max_length=60)
+
+
+@app.put("/api/settings", dependencies=[Depends(require_auth)])
+def put_settings(s: SettingsIn):
+    with db() as c:
+        set_setting(c, "title", s.title.strip())
+    return {"ok": True}
+
+
+@app.post("/api/share/rotate", dependencies=[Depends(require_auth)])
+def rotate_share():
+    with db() as c:
+        tok = secrets.token_urlsafe(18)
+        set_setting(c, "share_token", tok)
+    return {"share_token": tok}
+
+
+# ---------------------------------------------------------------- iCalendar feed
+def _esc(s: str) -> str:
+    return s.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+
+def _fold(line: str) -> list[str]:
+    out, b = [], line.encode()
+    while len(b) > 75:
+        cut = 75 if not out else 74
+        while cut > 0 and (b[cut] & 0xC0) == 0x80:  # don't split a UTF-8 char
+            cut -= 1
+        out.append(b[:cut].decode())
+        b = b[cut:]
+    out.append(b.decode())
+    return [out[0]] + [" " + x for x in out[1:]]
+
+
+def _utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _local(s: str) -> datetime:
+    return datetime.fromisoformat(s).replace(tzinfo=TZ)
+
+
+@app.get("/s/{token}/calendar.ics")
+def ics_feed(token: str):
+    today = datetime.now(TZ).date()
+    with db() as c:
+        check_token(c, token)
+        st = load_state(c, today - timedelta(days=120), today + timedelta(days=500), public=True)
+    by_id = {s["id"]: s for s in st["shifts"]}
+    stamp = _utc(datetime.now(timezone.utc))
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Shiftboard//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        f"X-WR-CALNAME:{_esc(st['title'])}",
+        f"X-WR-TIMEZONE:{TZ_NAME}",
+        "REFRESH-INTERVAL;VALUE=DURATION:PT1H",
+        "X-PUBLISHED-TTL:PT1H",
+    ]
+    for a in st["assignments"]:
+        s = by_id.get(a["shift_id"])
+        if not s:
+            continue
+        d = date.fromisoformat(a["day"])
+        ev = ["BEGIN:VEVENT", f"UID:shift-{a['day']}-{s['id']}@shiftboard", f"DTSTAMP:{stamp}"]
+        if s["all_day"]:
+            ev += [
+                f"DTSTART;VALUE=DATE:{d.strftime('%Y%m%d')}",
+                f"DTEND;VALUE=DATE:{(d + timedelta(days=1)).strftime('%Y%m%d')}",
+                "TRANSP:TRANSPARENT",
+            ]
+        else:
+            start = datetime.combine(d, time.fromisoformat(s["start_time"]), TZ)
+            end = datetime.combine(d, time.fromisoformat(s["end_time"]), TZ)
+            if end <= start:
+                end += timedelta(days=1)
+            ev += [f"DTSTART:{_utc(start)}", f"DTEND:{_utc(end)}", "TRANSP:OPAQUE"]
+        ev += [f"SUMMARY:{_esc(s['name'])}", "CATEGORIES:Shift", "END:VEVENT"]
+        lines += ev
+    for o in st["oncall"]:
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:oncall-{o['id']}@shiftboard",
+            f"DTSTAMP:{stamp}",
+            f"DTSTART:{_utc(_local(o['start']))}",
+            f"DTEND:{_utc(_local(o['end']))}",
+            f"SUMMARY:{_esc(o['label'])}",
+            "CATEGORIES:On call",
+            "TRANSP:TRANSPARENT",
+            "END:VEVENT",
+        ]
+    lines.append("END:VCALENDAR")
+    body = "\r\n".join(x for line in lines for x in _fold(line)) + "\r\n"
+    return Response(
+        body,
+        media_type="text/calendar; charset=utf-8",
+        headers={"Content-Disposition": 'inline; filename="shifts.ics"', "Cache-Control": "no-cache"},
+    )
+
+
+# ---------------------------------------------------------------- pages
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+@app.get("/")
+def index():
+    return FileResponse(STATIC / "index.html")
+
+
+@app.get("/s/{token}")
+def share_page(token: str):
+    with db() as c:
+        check_token(c, token)
+    return FileResponse(STATIC / "index.html")
