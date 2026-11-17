@@ -15,7 +15,7 @@ from datetime import date, datetime, time, timedelta
 MAX_ROWS, MAX_COLS = 600, 200
 MON = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
 WD = r"(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s*"
-RE_ISO = re.compile(rf"^(?:{WD})?(\d{{4}})-(\d{{1,2}})-(\d{{1,2}})(?:[ T]\d{{1,2}}:\d{{2}}(?::\d{{2}})?)?$", re.I)
+RE_ISO = re.compile(rf"^(?:{WD})?(\d{{4}})[-/.](\d{{1,2}})[-/.](\d{{1,2}})(?:[ T]\d{{1,2}}:\d{{2}}(?::\d{{2}})?)?$", re.I)
 RE_DMY = re.compile(rf"^(?:{WD})?(\d{{1,2}})[/.\-](\d{{1,2}})[/.\-](\d{{2,4}})(?:\s+\d{{1,2}}:\d{{2}}(?::\d{{2}})?)?$", re.I)
 RE_DM = re.compile(rf"^(?:{WD})?(\d{{1,2}})[/.](\d{{1,2}})$", re.I)
 RE_DMON = re.compile(rf"^(?:{WD})?(\d{{1,2}})(?:st|nd|rd|th)?[\s\-]*([a-z]{{3}})[a-z]*\.?[\s\-,]*(\d{{2,4}})?$", re.I)
@@ -143,6 +143,60 @@ def read_text(txt: str) -> list[tuple[str, list[list]]]:
             delim = "\t"
     rows = [row[:MAX_COLS] for _, row in zip(range(MAX_ROWS), csv.reader(io.StringIO(txt), delimiter=delim))]
     return [("Pasted", [[c.strip() if c.strip() != "" else None for c in r] for r in rows])]
+
+
+RE_DAYNUM = re.compile(rf"^(?:{WD})?(\d{{1,2}})(?:st|nd|rd|th)?$", re.I)
+
+
+def _daynum(v) -> int | None:
+    if isinstance(v, (int, float)) and float(v).is_integer() and 1 <= v <= 31:
+        return int(v)
+    if isinstance(v, str) and (m := RE_DAYNUM.match(v.strip())) and 1 <= int(m[1]) <= 31:
+        return int(m[1])
+    return None
+
+
+def series_from_daynums(sheets, anchor: date | None, today: date) -> list[dict]:
+    """Header row of day numbers only ('Mon 23', '23', ...): dates come from the first date given,
+    or the nearest matching day to today, counting one day per column."""
+    out = []
+    for sheet, rows in sheets:
+        width = max((len(r) for r in rows), default=0)
+        grid = [r + [None] * (width - len(r)) for r in rows]
+        for hi, row in enumerate(grid):
+            nums = [(j, _daynum(v)) for j, v in enumerate(row)]
+            nums = [(j, n) for j, n in nums if n]
+            if len(nums) < 5:
+                continue
+            # must run consecutively (allowing month rollover)
+            if not all(b[1] == a[1] + 1 or (b[1] == 1 and a[1] >= 28) for a, b in zip(nums, nums[1:])):
+                continue
+            first_col, first_num = nums[0]
+            if anchor and anchor.day == first_num:
+                start = anchor
+            else:
+                cands = []
+                for k in range(-60, 61):
+                    d = today + timedelta(days=k)
+                    if d.day == first_num:
+                        cands.append(d)
+                start = min(cands, key=lambda d: abs((d - today).days)) if not anchor else anchor
+            cols = {j: start + timedelta(days=i) for i, (j, _) in enumerate(nums)}
+            for ri in range(hi + 1, len(grid)):
+                r = grid[ri]
+                cells = {cols[j].isoformat(): text(r[j]) for j in cols if text(r[j])}
+                if not cells:
+                    continue
+                if len([1 for j in cols if _daynum(r[j])]) >= 5:
+                    break  # next header block
+                label = " ".join(text(r[j]) for j in range(first_col) if text(r[j])) or f"Row {ri + 1}"
+                days = sorted(cells)
+                out.append({"id": len(out), "sheet": sheet, "label": label[:80], "layout": "daynum",
+                            "cells": cells, "count": len(days), "start": min(cols.values()).isoformat(),
+                            "end": max(cols.values()).isoformat()})
+            if out:
+                return out
+    return out
 
 
 def series_from_first_date(sheets, first: date) -> list[dict]:

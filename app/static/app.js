@@ -55,7 +55,11 @@ const XHELP = {
 const fmtShort = s => { const d = parseYmd(s); return `${d.getDate()} ${MONTHS[d.getMonth()].slice(0, 3)}`; };
 
 function toast(msg) {
-  const t = $("#toast"); t.textContent = msg; t.classList.add("show");
+  const t = $("#toast");
+  // dialogs sit in the browser's top layer, so show the toast inside whichever one is open
+  const host = document.querySelector("dialog[open]") || document.body;
+  if (t.parentElement !== host) host.appendChild(t);
+  t.textContent = msg; t.classList.add("show");
   clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("show"), 2200);
 }
 
@@ -746,14 +750,26 @@ $("#impFile").addEventListener("change", async e => {
   toast("Reading roster…");
   const r = await fetch("/api/import/preview", { method: "POST", body: fd });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) return toast(j.detail || "Couldn't read that file");
+  if (!r.ok) return impMsg(j.detail || "Couldn't read that file");
+  impMsg("");
   startImport(j);
 });
+function impMsg(msg) { const el = $("#impMsg"); el.textContent = msg || ""; el.hidden = !msg; }
 $("#impRead").onclick = async () => {
   const text = $("#impText").value;
-  if (!text.trim()) return toast("Paste the roster cells first");
-  const j = await api("/api/import/paste", { method: "POST", body: { text, first_date: $("#impFirst").value || null } });
-  startImport(j);
+  impMsg("");
+  if (!text.trim()) return impMsg("Paste the roster cells into the box first.");
+  const btn = $("#impRead"); btn.disabled = true; btn.textContent = "Reading…";
+  try {
+    const r = await fetch("/api/import/paste", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, first_date: $("#impFirst").value || null }) });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401) return showLogin();
+    if (!r.ok) return impMsg(Array.isArray(j.detail) ? j.detail.map(e => e.msg).join(", ") : (j.detail || `Couldn't read that (${r.status})`));
+    startImport(j);
+  } catch (err) {
+    impMsg("Couldn't reach the server. Check you're connected and try again.");
+  } finally { btn.disabled = false; btn.textContent = "Read roster"; }
 };
 function startImport(j) {
   IMP = { ...j, map: {} };

@@ -19,7 +19,7 @@ from typing import Literal, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -204,6 +204,25 @@ def _backup_loop():
 def _start_backups():
     threading.Thread(target=_backup_loop, daemon=True, name="backups").start()
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+# Cache-busting: asset URLs carry a hash of their contents so phones never run stale JS/CSS
+ASSET_VERSION = hashlib.sha256(b"".join((STATIC / f).read_bytes() for f in ("app.js", "app.css"))).hexdigest()[:10]
+INDEX_HTML = ((STATIC / "index.html").read_text()
+              .replace("/static/app.js", f"/static/app.js?v={ASSET_VERSION}")
+              .replace("/static/app.css", f"/static/app.css?v={ASSET_VERSION}"))
+
+
+def index_response() -> HTMLResponse:
+    return HTMLResponse(INDEX_HTML, headers={"Cache-Control": "no-cache"})
+
+
+@app.middleware("http")
+async def static_cache_headers(request: Request, call_next):
+    resp = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        resp.headers["Cache-Control"] = ("public, max-age=31536000, immutable"
+                                         if request.query_params.get("v") else "no-cache")
+    return resp
 
 
 # ---------------------------------------------------------------- auth
@@ -734,7 +753,10 @@ class PasteIn(BaseModel):
 @app.post("/api/import/paste", dependencies=[Depends(require_auth)])
 def import_paste(p: PasteIn):
     sheets = importer.read_text(p.text)
-    series = importer.find_series(sheets, datetime.now(TZ).date())
+    today = datetime.now(TZ).date()
+    series = importer.find_series(sheets, today)
+    if not series:
+        series = importer.series_from_daynums(sheets, p.first_date, today)
     if not series and p.first_date:
         series = importer.series_from_first_date(sheets, p.first_date)
     if not series:
@@ -1011,11 +1033,11 @@ def healthz():
 
 @app.get("/")
 def index():
-    return FileResponse(STATIC / "index.html")
+    return index_response()
 
 
 @app.get("/s/{token}")
 def share_page(token: str):
     with db() as c:
         check_token(c, token)
-    return FileResponse(STATIC / "index.html")
+    return index_response()
