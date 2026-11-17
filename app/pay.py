@@ -201,7 +201,8 @@ def compute(period_start: date, shifts: dict, assignments: list, extras: list, o
         "holidays": {d.isoformat(): n for d, n in hols.items() if period_start <= d <= period_end},
     }
     if rate is None:
-        return out
+        rate = 0.0  # still work out hours; dollar figures come out as 0
+    lines = []  # one entry per paid item, used by the spreadsheet export
 
     ord_hours = ord_pay = pen_pay = leave_hours = 0.0
     pen_detail = {"shift": 0.0, "saturday": 0.0, "sunday": 0.0, "holiday": 0.0}
@@ -220,6 +221,9 @@ def compute(period_start: date, shifts: dict, assignments: list, extras: list, o
             hrs = float(s.get("paid_hours") or 0)
             if ptype in ("ordinary", "leave") and hrs:
                 leave_hours += hrs
+                lines.append({"day": d.isoformat(), "kind": "leave", "name": s["name"], "code": s["code"],
+                              "start": "", "end": "", "hours": hrs, "base": hrs * rate, "penalty": 0.0,
+                              "amount": hrs * rate, "detail": "Paid leave"})
             if ptype == "ordinary":
                 rostered_days.add(d)
             continue
@@ -228,13 +232,17 @@ def compute(period_start: date, shifts: dict, assignments: list, extras: list, o
         paid = max(0.0, total - (s.get("break_mins") or 0) / 60)
         ratio = paid / total if total else 0
         if ptype == "overtime":
-            ot_items.append((d, st, paid, "ot_shift", paid, s["name"]))
+            ot_items.append((d, st, paid, "ot_shift", paid, s["name"], s))
             continue
         if ptype == "leave":
             leave_hours += paid
+            lines.append({"day": d.isoformat(), "kind": "leave", "name": s["name"], "code": s["code"],
+                          "start": s["start_time"], "end": s["end_time"], "hours": paid, "base": paid * rate,
+                          "penalty": 0.0, "amount": paid * rate, "detail": "Paid leave"})
             continue
         rostered_days.add(d)
         pct = shift_penalty_pct(st.time())
+        line_pen, line_detail = 0.0, set()
         for seg_day, seg_h in _segments(st, en):
             h = seg_h * ratio
             ord_hours += h
@@ -249,6 +257,14 @@ def compute(period_start: date, shifts: dict, assignments: list, extras: list, o
                 p, k = pct, "shift"
             pen_pay += h * rate * p
             pen_detail[k] += h * rate * p
+            line_pen += h * rate * p
+            if p:
+                line_detail.add({"shift": f"shift {p * 100:g}%", "saturday": "Saturday",
+                                 "sunday": "Sunday", "holiday": "public holiday"}[k])
+        lines.append({"day": d.isoformat(), "kind": "shift", "name": s["name"], "code": s["code"],
+                      "start": s["start_time"], "end": s["end_time"], "hours": paid, "base": paid * rate,
+                      "penalty": line_pen, "amount": paid * rate + line_pen,
+                      "detail": ", ".join(sorted(line_detail)) or "Ordinary"})
 
     extra_out = []
     for x in extras:
@@ -258,7 +274,7 @@ def compute(period_start: date, shifts: dict, assignments: list, extras: list, o
         st, en = _span(d, x["start"], x["end"])
         actual = (en - st).total_seconds() / 3600
         payable = max(actual, MIN_HOURS.get(x["kind"], 0))
-        ot_items.append((d, st, payable, x["kind"], actual, x.get("id")))
+        ot_items.append((d, st, payable, x["kind"], actual, x.get("id"), x))
 
     # overtime ladder — each day stands alone (cl 9(xiii)), keyed on the day the work started
     ot_items.sort(key=lambda t: t[1])
@@ -266,7 +282,7 @@ def compute(period_start: date, shifts: dict, assignments: list, extras: list, o
     ot_by_kind = {"ot_shift": 0.0, "overtime": 0.0, "callin": 0.0, "remote": 0.0}
     hrs_by_kind = {"ot_shift": 0.0, "overtime": 0.0, "callin": 0.0, "remote": 0.0}
     count_by_kind = {"ot_shift": 0, "overtime": 0, "callin": 0, "remote": 0}
-    for d, st, payable, kind, actual, ref in ot_items:
+    for d, st, payable, kind, actual, ref, src in ot_items:
         if d in hols:
             amt = payable * rate * 2.5
         elif d.weekday() == 6:
@@ -279,6 +295,14 @@ def compute(period_start: date, shifts: dict, assignments: list, extras: list, o
         ot_by_kind[kind] += amt
         hrs_by_kind[kind] += payable
         count_by_kind[kind] += 1
+        if kind == "ot_shift":
+            lines.append({"day": d.isoformat(), "kind": "ot_shift", "name": src["name"], "code": src["code"],
+                          "start": src["start_time"], "end": src["end_time"], "hours": payable, "base": 0.0,
+                          "penalty": 0.0, "amount": amt, "detail": "Overtime shift"})
+        else:
+            lines.append({"day": d.isoformat(), "kind": kind, "name": EXTRA_LABEL[kind], "code": "",
+                          "start": src["start"], "end": src["end"], "hours": payable, "actual_hours": actual,
+                          "base": 0.0, "penalty": 0.0, "amount": amt, "detail": src.get("note") or ""})
         extra_out.append({"id": ref if kind != "ot_shift" else None, "name": ref if kind == "ot_shift" else None,
                           "day": d.isoformat(), "kind": kind, "actual_hours": round(actual, 2),
                           "paid_hours": round(payable, 2), "amount": round(amt, 2)})
@@ -296,7 +320,13 @@ def compute(period_start: date, shifts: dict, assignments: list, extras: list, o
             bs = st + timedelta(days=i)
             if p_st <= bs < p_en:
                 oc_blocks += 1
-                oc_pay += oc_on if bs.date() in rostered_days else oc_off
+                on = bs.date() in rostered_days
+                amt = (oc_on if on else oc_off) if out["configured"] else 0.0
+                oc_pay += amt
+                lines.append({"day": bs.date().isoformat(), "kind": "oncall", "name": o.get("label") or "On call",
+                              "code": "", "start": o["start"], "end": o["end"], "hours": 0.0, "base": 0.0,
+                              "penalty": 0.0, "amount": amt,
+                              "detail": "rostered on duty" if on else "rostered off duty"})
         oc_hours += max(0.0, (min(en, p_en) - max(st, p_st)).total_seconds() / 3600)
 
     leave_pay = leave_hours * rate
@@ -322,6 +352,7 @@ def compute(period_start: date, shifts: dict, assignments: list, extras: list, o
         "oncall_rates": {"on_duty": oc_on, "off_duty": oc_off},
         "extras": extra_out,
         "contract_hours": WEEKLY_HOURS * 2,
+        "lines": sorted(lines, key=lambda x: (x["day"], x["start"] or "")),
         "gross": r2(gross),
     })
     return out

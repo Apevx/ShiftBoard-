@@ -459,7 +459,11 @@ function selectTab(name) {
   $$("#setDlg [data-pane]").forEach(p => p.hidden = p.dataset.pane !== name);
   if (name === "pay") loadPaySettings();
 }
-function openSettings(tab = "shifts") { renderSettings(); selectTab(tab); $("#setDlg").showModal(); }
+function openSettings(tab = "shifts") {
+  renderSettings(); selectTab(tab);
+  $("#pdfMonth").value = monthStr(cur); xlsInfo();
+  $("#setDlg").showModal();
+}
 $("#settingsBtn").onclick = () => openSettings();
 $("#tabs").addEventListener("click", e => {
   const b = e.target.closest("button[data-tab]"); if (b) selectTab(b.dataset.tab);
@@ -616,6 +620,134 @@ $("#clearRange").onclick = async () => {
   if (!confirm(`Remove every shift from ${fmtDay(start)} to ${fmtDay(end)}?`)) return;
   const r = await api("/api/clear", { method: "POST", body: { start, end } });
   toast(`Removed ${r.removed} shifts`); load();
+};
+
+/* ---------- exports ---------- */
+const monthStr = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
+function download(url) {
+  const a = document.createElement("a"); a.href = url; a.download = ""; document.body.appendChild(a); a.click(); a.remove();
+}
+function pdfUrl(month, notes = true) { return `/api/export/month.pdf?month=${month}&sun=${weekStartSun ? 1 : 0}&notes=${notes ? 1 : 0}`; }
+$("#pdfBtn").onclick = () => { download(pdfUrl(monthStr(cur))); toast("Downloading PDF…"); };
+$("#pdfDownload").onclick = () => { download(pdfUrl($("#pdfMonth").value || monthStr(cur), $("#pdfNotes").checked)); toast("Downloading PDF…"); };
+function xlsRange() {
+  const t = new Date(), y = t.getFullYear(), m = t.getMonth();
+  const fyStart = m >= 6 ? y : y - 1;
+  switch ($("#xlsRange").value) {
+    case "month": return [ymd(new Date(y, m, 1)), ymd(new Date(y, m + 1, 0))];
+    case "lastmonth": return [ymd(new Date(y, m - 1, 1)), ymd(new Date(y, m, 0))];
+    case "fy": return [`${fyStart}-07-01`, `${fyStart + 1}-06-30`];
+    case "lastfy": return [`${fyStart - 1}-07-01`, `${fyStart}-06-30`];
+    default: return [$("#xlsStart").value, $("#xlsEnd").value];
+  }
+}
+function xlsInfo() {
+  $("#xlsCustom").hidden = $("#xlsRange").value !== "custom";
+  const [a, b] = xlsRange();
+  $("#xlsInfo").textContent = a && b ? `${fmtDay(a)} ${a.slice(0, 4)} – ${fmtDay(b)} ${b.slice(0, 4)}` : "";
+}
+["xlsRange", "xlsStart", "xlsEnd"].forEach(id => $("#" + id).addEventListener("change", xlsInfo));
+$("#xlsDownload").onclick = () => {
+  const [a, b] = xlsRange();
+  if (!a || !b || b < a) return toast("Check the date range");
+  download(`/api/export/hours.xlsx?start=${a}&end=${b}`); toast("Downloading spreadsheet…");
+};
+
+/* ---------- roster import ---------- */
+let IMP = null;
+const TIME_RANGE = /^(\d{1,2}):?(\d{2})\s*[-–to]+\s*(\d{1,2}):?(\d{2})$/i;
+function shiftForTimes(tok) {
+  const m = tok.match(TIME_RANGE); if (!m) return null;
+  const st = `${pad(+m[1])}:${m[2]}`, en = `${pad(+m[3])}:${m[4]}`;
+  return activeShifts().find(s => !s.all_day && s.start_time === st && s.end_time === en) || null;
+}
+function tokensOf(cell) {
+  const v = cell.trim();
+  if (!v) return [];
+  const up = v.toUpperCase();
+  if (TIME_RANGE.test(v) || IMP.aliases[up] !== undefined || activeShifts().some(s => s.code.toUpperCase() === up)) return [up];
+  return v.split(/[\/,+;|\n]+|\s+/).map(t => t.trim().toUpperCase()).filter(Boolean);
+}
+function guessMap(tok) {
+  if (IMP.aliases[tok] !== undefined) return IMP.aliases[tok];
+  const sh = activeShifts();
+  const byCode = sh.find(s => s.code.toUpperCase() === tok) || sh.find(s => s.name.toUpperCase() === tok) || shiftForTimes(tok);
+  if (byCode) return String(byCode.id);
+  if (/^(OC|ONCALL|ON-CALL|OCALL|CALL)$/.test(tok)) return "oncall";
+  return "";
+}
+$("#impFile").addEventListener("change", async e => {
+  const f = e.target.files[0]; if (!f) return;
+  const fd = new FormData(); fd.append("file", f);
+  e.target.value = "";
+  toast("Reading roster…");
+  const r = await fetch("/api/import/preview", { method: "POST", body: fd });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) return toast(j.detail || "Couldn't read that file");
+  IMP = { ...j, map: {} };
+  const last = ls.get("importLabel", "");
+  const sel = $("#impSeries");
+  sel.innerHTML = j.series.map(s => `<option value="${s.id}">${esc(s.label)} · ${fmtShort(s.start)}–${fmtShort(s.end)} (${s.count})${j.series.some(o => o.sheet !== s.sheet) ? " · " + esc(s.sheet) : ""}</option>`).join("");
+  const pick = j.series.find(s => s.label === last) || j.series.find(s => s.layout === "across" && s.label.toLowerCase().includes((S.title || "").toLowerCase().split(" ")[0])) || j.series[0];
+  sel.value = pick.id;
+  $("#impStep").hidden = false;
+  renderImport();
+});
+$("#impSeries").addEventListener("change", renderImport);
+function currentSeries() { return IMP.series.find(s => s.id === +$("#impSeries").value); }
+function renderImport() {
+  const ser = currentSeries(), counts = {};
+  for (const v of Object.values(ser.cells)) for (const t of tokensOf(v)) counts[t] = (counts[t] || 0) + 1;
+  const opts = `<option value="">Ignore (day off)</option><option value="oncall">On call</option>` +
+    activeShifts().map(s => `<option value="${s.id}">${esc(s.code)} · ${esc(s.name)}</option><option value="${s.id}:ot">${esc(s.code)} · ${esc(s.name)} (overtime)</option>`).join("");
+  const toks = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+  for (const t of toks) if (!(t in IMP.map)) IMP.map[t] = guessMap(t);
+  $("#impMap").innerHTML = toks.map(t => `<div class="maprow${IMP.map[t] === "" && IMP.aliases[t] === undefined ? " unset" : ""}">
+      <span class="tok">${esc(t)}</span><span class="cnt">×${counts[t]}</span>
+      <select data-tok="${esc(t)}">${opts}</select></div>`).join("");
+  $$("#impMap select").forEach(sel => { sel.value = IMP.map[sel.dataset.tok]; });
+  impSummary();
+}
+$("#impMap").addEventListener("change", e => {
+  const sel = e.target.closest("select"); if (!sel) return;
+  IMP.map[sel.dataset.tok] = sel.value; sel.closest(".maprow").classList.remove("unset"); impSummary();
+});
+function buildImport() {
+  const ser = currentSeries(), items = [], oncall = [];
+  const oc = ls.get("ocDefaults", { label: "On call", st: "17:00", et: "08:00" });
+  for (const [day, v] of Object.entries(ser.cells)) {
+    for (const t of tokensOf(v)) {
+      const m = IMP.map[t];
+      if (!m) continue;
+      if (m === "oncall") {
+        const end = oc.et <= oc.st ? ymd(addDays(parseYmd(day), 1)) : day;
+        oncall.push({ start: `${day}T${oc.st}`, end: `${end}T${oc.et}`, label: oc.label || "On call" });
+      } else {
+        const [id, ot] = m.split(":");
+        items.push({ day, shift_id: +id, ot: ot === "ot" });
+      }
+    }
+  }
+  return { start: ser.start, end: ser.end, items, oncall };
+}
+function impSummary() {
+  const b = buildImport(), ser = currentSeries();
+  const unknown = Object.entries(IMP.map).filter(([t, m]) => m === "" && IMP.aliases[t] === undefined).length;
+  $("#impSummary").textContent = `${fmtDay(ser.start)} – ${fmtDay(ser.end)}: ${b.items.length} shifts, ${b.oncall.length} on-call periods` +
+    (unknown ? ` · ${unknown} code${unknown > 1 ? "s" : ""} set to ignore (highlighted)` : "");
+}
+$("#impApply").onclick = async () => {
+  const b = buildImport();
+  const replace = $("#impReplace").checked;
+  if (replace && !confirm(`Replace all shifts from ${fmtDay(b.start)} to ${fmtDay(b.end)} with this roster?`)) return;
+  const aliases = {};
+  for (const [t, m] of Object.entries(IMP.map)) aliases[t] = m === "" ? "" : m;
+  const r = await api("/api/import/apply", { method: "POST", body: { ...b, replace, aliases } });
+  ls.set("importLabel", currentSeries().label);
+  toast(`Imported ${r.assigned} shifts${r.oncall ? ` and ${r.oncall} on-call periods` : ""}`);
+  $("#impStep").hidden = true; IMP = null;
+  $("#setDlg").close();
+  const d = parseYmd(b.start); cur = new Date(d.getFullYear(), d.getMonth(), 1); load();
 };
 
 /* share + general */

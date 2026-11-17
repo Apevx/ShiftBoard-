@@ -1,3 +1,7 @@
 fastapi==0.115.6
 uvicorn==0.32.1
 tzdata
+reportlab==5.0.1
+openpyxl==3.1.5
+xlrd==2.0.2
+python-multipart==0.0.20

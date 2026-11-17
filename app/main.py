@@ -15,11 +15,12 @@ from pathlib import Path
 from typing import Literal, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import exports, importer
 from . import pay as paycalc
 
 DB_PATH = os.environ.get("DB_PATH", "/data/shiftboard.db")
@@ -577,22 +578,134 @@ def put_pay_settings(p: PaySettingsIn):
     return {"ok": True}
 
 
+def pay_for(c, start: date, ps: dict) -> dict:
+    """Pay estimate for the fortnight starting on `start`."""
+    end = start + timedelta(days=13)
+    shifts = {r["id"]: dict(r) for r in c.execute("SELECT * FROM shifts")}
+    assignments = [dict(r) for r in c.execute(
+        "SELECT day, shift_id, ot FROM assignments WHERE day BETWEEN ? AND ?", (start.isoformat(), end.isoformat()))]
+    extras = [dict(r) for r in c.execute(
+        "SELECT * FROM extras WHERE day BETWEEN ? AND ?", (start.isoformat(), end.isoformat()))]
+    hi = f"{(end + timedelta(days=1)).isoformat()}T00:00"
+    lo = f"{(start - timedelta(days=60)).isoformat()}T00:00"
+    oncall = [dict(r) for r in c.execute("SELECT * FROM oncall WHERE end > ? AND start < ?", (lo, hi))]
+    return paycalc.compute(start, shifts, assignments, extras, oncall, ps)
+
+
 @app.get("/api/pay", dependencies=[Depends(require_auth)])
 def get_pay(on: Optional[date] = None):
     with db() as c:
         ps = pay_settings(c)
         start = paycalc.fortnight_containing(on or datetime.now(TZ).date(), ps)
-        end = start + timedelta(days=13)
-        shifts = {r["id"]: dict(r) for r in c.execute("SELECT * FROM shifts")}
-        assignments = [dict(r) for r in c.execute(
-            "SELECT day, shift_id, ot FROM assignments WHERE day BETWEEN ? AND ?", (start.isoformat(), end.isoformat()))]
+        out = pay_for(c, start, ps)
+    out.pop("lines", None)
+    return out
+
+
+# ---------------------------------------------------------------- exports
+def _dl(body: bytes, media: str, filename: str) -> Response:
+    return Response(body, media_type=media, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.get("/api/export/month.pdf", dependencies=[Depends(require_auth)])
+def export_month_pdf(month: str, sun: bool = False, notes: bool = True):
+    try:
+        y, m = map(int, month.split("-"))
+        first = date(y, m, 1)
+    except ValueError:
+        raise HTTPException(400, "month must be YYYY-MM")
+    last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    with db() as c:
+        st = load_state(c, first - timedelta(days=7), last + timedelta(days=7), public=False)
         extras = [dict(r) for r in c.execute(
-            "SELECT * FROM extras WHERE day BETWEEN ? AND ?", (start.isoformat(), end.isoformat()))]
-        hi = f"{(end + timedelta(days=1)).isoformat()}T00:00"
-        oncall = [dict(r) for r in c.execute(
-            "SELECT * FROM oncall WHERE end > ? AND start < ?",
-            ((start - timedelta(days=60)).isoformat() + "T00:00", hi))]
-    return paycalc.compute(start, shifts, assignments, extras, oncall, ps)
+            "SELECT * FROM extras WHERE day BETWEEN ? AND ?", (first.isoformat(), last.isoformat()))]
+    shifts = {s["id"]: s for s in st["shifts"]}
+    pdf = exports.month_pdf(y, m, st["title"], shifts, st["assignments"], st["oncall"], extras,
+                            st["notes"] if notes else {}, week_start_sun=sun)
+    return _dl(pdf, "application/pdf", f"shifts-{y}-{m:02d}.pdf")
+
+
+@app.get("/api/export/hours.xlsx", dependencies=[Depends(require_auth)])
+def export_hours(start: date, end: date):
+    if end < start or (end - start).days > 800:
+        raise HTTPException(400, "Bad date range")
+    with db() as c:
+        ps = pay_settings(c)
+        title = get_setting(c, "title")
+        f = paycalc.fortnight_containing(start, ps)
+        fortnights = []
+        while f <= end:
+            fortnights.append(pay_for(c, f, ps))
+            f += timedelta(days=14)
+    body = exports.hours_xlsx(start, end, fortnights, f"{title} — hours & pay")
+    return _dl(body, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+               f"shifts-{start.isoformat()}-to-{end.isoformat()}.xlsx")
+
+
+# ---------------------------------------------------------------- roster import
+@app.post("/api/import/preview", dependencies=[Depends(require_auth)])
+async def import_preview(file: UploadFile = File(...)):
+    data = await file.read()
+    if len(data) > 15 * 1024 * 1024:
+        raise HTTPException(413, "File is too large (15 MB max)")
+    try:
+        sheets = importer.read_book(data, file.filename or "roster.xlsx")
+    except Exception as e:  # unreadable / wrong format
+        raise HTTPException(400, f"Couldn't read that file ({type(e).__name__}). Save it as .xlsx or .csv and try again.")
+    series = importer.find_series(sheets, datetime.now(TZ).date())
+    if not series:
+        raise HTTPException(400, "Couldn't find any dates in that file. Dates need to be in a header row or a column.")
+    with db() as c:
+        aliases = json.loads(get_setting(c, "import_aliases") or "{}")
+    return {"series": series, "aliases": aliases, "filename": file.filename}
+
+
+class ImportItem(BaseModel):
+    day: date
+    shift_id: int
+    ot: bool = False
+
+
+class ImportOnCall(BaseModel):
+    start: str = Field(pattern=LOCAL_DT)
+    end: str = Field(pattern=LOCAL_DT)
+    label: str = Field(default="On call", max_length=40)
+
+
+class ImportApplyIn(BaseModel):
+    start: date
+    end: date
+    replace: bool = True
+    items: list[ImportItem] = []
+    oncall: list[ImportOnCall] = []
+    aliases: dict[str, str] = {}
+
+
+@app.post("/api/import/apply", dependencies=[Depends(require_auth)])
+def import_apply(p: ImportApplyIn):
+    check_range(p.start, p.end)
+    with db() as c:
+        valid = {r[0] for r in c.execute("SELECT id FROM shifts")}
+        if p.replace:
+            c.execute("DELETE FROM assignments WHERE day BETWEEN ? AND ?", (p.start.isoformat(), p.end.isoformat()))
+        n = 0
+        for it in p.items:
+            if it.shift_id in valid and p.start <= it.day <= p.end:
+                c.execute("INSERT INTO assignments(day, shift_id, ot) VALUES(?,?,?) "
+                          "ON CONFLICT(day, shift_id) DO UPDATE SET ot=excluded.ot",
+                          (it.day.isoformat(), it.shift_id, int(it.ot)))
+                n += 1
+        oc = 0
+        for o in p.oncall:
+            if o.end <= o.start:
+                continue
+            if not c.execute("SELECT 1 FROM oncall WHERE start=? AND end=?", (o.start, o.end)).fetchone():
+                c.execute("INSERT INTO oncall(label,start,end) VALUES(?,?,?)", (o.label, o.start, o.end))
+                oc += 1
+        saved = json.loads(get_setting(c, "import_aliases") or "{}")
+        saved.update({k[:40]: v[:20] for k, v in p.aliases.items()})
+        set_setting(c, "import_aliases", json.dumps(saved))
+    return {"assigned": n, "oncall": oc}
 
 
 # ---------------------------------------------------------------- settings / sharing

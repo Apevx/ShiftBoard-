@@ -143,7 +143,7 @@ button.danger { background: none; color: var(--danger); border: 1px solid color-
 .center { text-align: center; }
 
 .tabs { display: flex; gap: 4px; padding: 4px 16px 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
-.tabs button { border: none; background: none; padding: 8px 10px; font-weight: 600; color: var(--muted); border-bottom: 2px solid transparent; }
+.tabs button { white-space: nowrap; border: none; background: none; padding: 8px 10px; font-weight: 600; color: var(--muted); border-bottom: 2px solid transparent; }
 .tabs button.on { color: var(--text); border-color: var(--accent); }
 
 .pattern { display: flex; flex-wrap: wrap; gap: 4px; min-height: 40px; padding: 8px; border-radius: 10px; background: var(--other); margin-bottom: 8px; align-items: center; }
@@ -173,3 +173,11 @@ body:not(.share) .share-only { display: none !important; }
 .otbtn { border: 1px solid var(--line) !important; border-radius: 8px; font-size: 11px !important; font-weight: 800; padding: 4px 7px !important; }
 .otbtn.on { background: #dc2626 !important; color: #fff !important; border-color: #dc2626 !important; }
 .otpill { font-size: 11px; font-weight: 700; color: #fff; background: #dc2626; border-radius: 6px; padding: 1px 6px; margin-left: 4px; vertical-align: 1px; }
+
+.filebtn { display: block; text-align: center; border-radius: 10px; padding: 11px; font-weight: 650; cursor: pointer;
+  background: var(--other); border: 1px dashed var(--muted); margin-bottom: 10px; color: var(--text); font-size: 14px; }
+.maprow { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); }
+.maprow .tok { font-weight: 800; min-width: 64px; font-family: ui-monospace, Menlo, monospace; }
+.maprow .cnt { color: var(--muted); font-size: 12px; min-width: 34px; }
+.maprow select { flex: 1; padding: 7px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+.maprow.unset select { border-color: #f59e0b; }
