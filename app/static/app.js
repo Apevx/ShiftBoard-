@@ -386,8 +386,47 @@ async function showPay() {
       <tr class="tot"><td>Estimated gross</td><td class="r">${money(p.gross, true)}</td></tr>
     </table>
     ${hol ? `<p class="muted small">Public holidays: ${hol}</p>` : ""}
-    <p class="muted small">Estimate before tax and super. Check against your payslip.</p>`;
+    <p class="muted small">Estimate before tax and super.</p>`;
+  PAY_SHOWN = p;
+  const f = $("#slipForm");
+  f.gross.value = p.payslip ? p.payslip.gross : "";
+  f.note.value = p.payslip?.note || "";
+  renderSlipDiff();
+  loadSlipHistory();
   if (!$("#payDlg").open) $("#payDlg").showModal();
+}
+let PAY_SHOWN = null;
+function diffText(d) {
+  if (Math.abs(d) < 1) return { cls: "ok", txt: "Payslip matches the estimate ✓" };
+  return { cls: "warn", txt: `Payslip is <b>${money(Math.abs(d), true)} ${d < 0 ? "less" : "more"}</b> than the estimate` };
+}
+function renderSlipDiff() {
+  const v = $("#slipForm").gross.value, el = $("#slipDiff");
+  if (v === "" || !PAY_SHOWN) { el.className = "slipdiff"; el.innerHTML = ""; return; }
+  const t = diffText(+v - PAY_SHOWN.gross);
+  el.className = "slipdiff " + t.cls; el.innerHTML = t.txt +
+    (t.cls === "warn" ? '<div class="muted small">Overtime and call-ins are often paid a fortnight late. Check the next payslip before chasing it up.</div>' : "");
+}
+$("#slipForm").gross.addEventListener("input", renderSlipDiff);
+$("#slipForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const f = e.target;
+  if (f.gross.value === "") return toast("Enter the gross amount from your payslip");
+  await api(`/api/payslips/${PAY_SHOWN.start}`, { method: "PUT", body: { gross: +f.gross.value, note: f.note.value.trim() || null } });
+  toast("Payslip saved"); showPay();
+});
+$("#slipClear").onclick = async () => {
+  if (!PAY_SHOWN?.payslip) { $("#slipForm").reset(); renderSlipDiff(); return; }
+  await api(`/api/payslips/${PAY_SHOWN.start}`, { method: "DELETE" });
+  showPay();
+};
+async function loadSlipHistory() {
+  const { history } = await api("/api/payslips?limit=8");
+  $("#slipHistory").innerHTML = history.length ? `<table class="hist">
+    <tr><th>Fortnight</th><th class="r">Estimate</th><th class="r">Payslip</th><th class="r">Diff</th></tr>
+    ${history.map(h => `<tr><td>${fmtShort(h.start)}</td><td class="r">${money(h.estimate)}</td><td class="r">${money(h.payslip)}</td>
+      <td class="r ${Math.abs(h.difference) < 1 ? "pos" : "neg"}">${h.difference >= 0 ? "+" : "−"}${money(Math.abs(h.difference))}</td></tr>`).join("")}
+    </table>` : "";
 }
 $("#payPrev").onclick = () => { payOn = ymd(addDays(parseYmd(payOn), -14)); showPay(); };
 $("#payNext").onclick = () => { payOn = ymd(addDays(parseYmd(payOn), 14)); showPay(); };
@@ -458,6 +497,7 @@ function selectTab(name) {
   $$("#tabs button").forEach(x => x.classList.toggle("on", x.dataset.tab === name));
   $$("#setDlg [data-pane]").forEach(p => p.hidden = p.dataset.pane !== name);
   if (name === "pay") loadPaySettings();
+  if (name === "files") loadBackups();
 }
 function openSettings(tab = "shifts") {
   renderSettings(); selectTab(tab);
@@ -652,6 +692,29 @@ $("#xlsDownload").onclick = () => {
   if (!a || !b || b < a) return toast("Check the date range");
   download(`/api/export/hours.xlsx?start=${a}&end=${b}`); toast("Downloading spreadsheet…");
 };
+
+/* ---------- backups ---------- */
+const fmtSize = n => n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
+async function loadBackups() {
+  const b = await api("/api/backups");
+  const last = b.backups[0];
+  $("#bkInfo").textContent = `Automatic daily backup on the server (keeps ${b.keep}). ` +
+    (last ? `Latest: ${fmtDT(last.created)}.` : "No backups yet.");
+  $("#bkList").innerHTML = b.backups.slice(0, 5).map(x => `<div class="bkrow"><span>${fmtDT(x.created)}${x.name.includes("prerestore") ? " · before restore" : ""} · ${fmtSize(x.size)}</span>
+    <a href="/api/backups/${x.name}" download>Download</a></div>`).join("");
+}
+$("#bkDownload").onclick = () => { download("/api/backup/download"); toast("Downloading backup…"); setTimeout(loadBackups, 1500); };
+$("#bkNow").onclick = async () => { await api("/api/backups", { method: "POST" }); toast("Backup saved on the server"); loadBackups(); };
+$("#bkRestore").addEventListener("change", async e => {
+  const f = e.target.files[0]; e.target.value = "";
+  if (!f) return;
+  if (!confirm(`Restore "${f.name}"? Everything will be replaced with the contents of this backup. A safety copy of the current data is saved first.`)) return;
+  const fd = new FormData(); fd.append("file", f);
+  const r = await fetch("/api/backup/restore", { method: "POST", body: fd });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) return toast(j.detail || "Restore failed");
+  toast("Restored. Reloading…"); setTimeout(() => location.reload(), 1200);
+});
 
 /* ---------- roster import ---------- */
 let IMP = null;

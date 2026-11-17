@@ -34,6 +34,12 @@ Pay rules follow the NSW Health *Medical Radiation Scientists (State) Award 2025
 - **Calendar PDF:** the **PDF** button in the header downloads the month on screen (A4 landscape, shift times, overtime, call-ins, on call, notes, legend and totals). Pick another month in Settings → Files.
 - **Hours & pay spreadsheet:** this month, last month, this/last financial year or a custom range. Sheets: Summary, Shifts (paid hours, penalties, base/penalty/total pay per shift), Extra work, On call, Fortnights.
 
+## Backups & payslips
+
+- A backup is taken automatically once a day into `/backups` (the last `BACKUP_KEEP`, default 30, are kept). Map `/backups` to a different disk or NAS share if you can.
+- **Settings → Files → Download a backup to this device** saves a `.db` file you can keep in iCloud Drive / Google Drive. **Restore from a backup file** replaces everything with that backup (a safety copy is taken first).
+- **Payslips:** in the pay breakdown, enter the gross from your payslip. It shows the difference from the estimate and keeps a history; the spreadsheet's Fortnights sheet includes payslip and difference columns.
+
 ## Sharing
 
 Settings → Share gives you two links. Both are read-only, and your private notes are never included.
@@ -65,6 +71,8 @@ Editing is protected by `ADMIN_PASSWORD`. If you expose the whole app, use a lon
 | `PUBLIC_URL` | *(blank)* | External base URL used in share links |
 | `APP_TITLE` | `My Shifts` | Initial calendar name (can be changed later in Settings) |
 | `DB_PATH` | `/data/shiftboard.db` | |
+| `BACKUP_DIR` | `/data/backups` | Where daily backups go |
+| `BACKUP_KEEP` | `30` | Number of daily backups kept |
 
 ## Tech
 

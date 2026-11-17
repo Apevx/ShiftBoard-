@@ -293,25 +293,30 @@ def hours_xlsx(start: date, end: date, fortnights: list[dict], title: str) -> by
     # --- Fortnights (whole pay periods, including any that run past the range edges)
     wf = _sheet(wb, "Fortnights", ["Period start", "Period end", "Ordinary hours", "Ordinary pay", "Penalties",
                                    "Paid leave", "Overtime hours", "Overtime pay", "Call-ins", "Call-in pay",
-                                   "On-call allowances", "On-call pay", "Estimated gross"],
-                [13, 13, 14, 13, 12, 12, 14, 13, 9, 12, 17, 12, 15])
+                                   "On-call allowances", "On-call pay", "Estimated gross", "Payslip gross",
+                                   "Difference", "Payslip note"],
+                [13, 13, 14, 13, 12, 12, 14, 13, 9, 12, 17, 12, 15, 14, 12, 24])
     fortnights = [f for f in fortnights if f.get("gross") or f.get("ordinary_hours") or f.get("leave_hours")
-                  or f.get("overtime_hours") or f.get("oncall_count") or f.get("callin_count")]
+                  or f.get("overtime_hours") or f.get("oncall_count") or f.get("callin_count") or f.get("payslip")]
     for f in fortnights:
         wf.append([date.fromisoformat(f["start"]), date.fromisoformat(f["end"]), f.get("ordinary_hours", 0),
                    f.get("ordinary_pay", 0), f.get("penalties", 0), f.get("leave_pay", 0), f.get("overtime_hours", 0),
                    f.get("overtime_pay", 0), f.get("callin_count", 0), f.get("callin_pay", 0),
-                   f.get("oncall_count", 0), f.get("oncall_pay", 0), f.get("gross", 0)])
+                   f.get("oncall_count", 0), f.get("oncall_pay", 0), f.get("gross", 0),
+                   (f.get("payslip") or {}).get("gross"), (f.get("payslip") or {}).get("difference"),
+                   (f.get("payslip") or {}).get("note")])
     keys = ["ordinary_hours", "ordinary_pay", "penalties", "leave_pay", "overtime_hours", "overtime_pay",
             "callin_count", "callin_pay", "oncall_count", "oncall_pay", "gross"]
-    wf.append(["Total", ""] + [round(sum(f.get(k, 0) for f in fortnights), 2) for k in keys])
+    slips = [f["payslip"] for f in fortnights if f.get("payslip")]
+    wf.append(["Total", ""] + [round(sum(f.get(k, 0) for f in fortnights), 2) for k in keys]
+              + ([round(sum(p["gross"] for p in slips), 2), round(sum(p["difference"] for p in slips), 2)] if slips else []))
     for cell in wf[wf.max_row]:
         cell.font, cell.border = TOTAL_FONT, THIN
     _fmt(wf, 1, "dd/mm/yyyy"); _fmt(wf, 2, "dd/mm/yyyy")
     wf.cell(row=wf.max_row, column=1).number_format = "General"
     for col in (3, 7):
         _fmt(wf, col, HRS)
-    for col in (4, 5, 6, 8, 10, 12, 13):
+    for col in (4, 5, 6, 8, 10, 12, 13, 14, 15):
         _fmt(wf, col, MONEY)
 
     # --- Summary

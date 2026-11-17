@@ -12,5 +12,9 @@ services:
       # Optional: the public address people outside your LAN will use, e.g. https://shifts.example.com
       # PUBLIC_URL: https://shifts.example.com
       APP_TITLE: My Shifts
+      BACKUP_DIR: /backups
+      BACKUP_KEEP: "30"
     volumes:
       - ./data:/data
+      # Point this at a different disk or NAS share if you can
+      - ./backups:/backups

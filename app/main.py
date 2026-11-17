@@ -7,8 +7,11 @@ import hashlib
 import json
 import hmac
 import os
+import re
 import secrets
 import sqlite3
+import tempfile
+import threading
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -71,6 +74,7 @@ CREATE TABLE IF NOT EXISTS extras(
 CREATE INDEX IF NOT EXISTS idx_extras_day ON extras(day);
 CREATE TABLE IF NOT EXISTS notes(day TEXT PRIMARY KEY, text TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS payslips(period_start TEXT PRIMARY KEY, gross REAL NOT NULL, note TEXT);
 CREATE INDEX IF NOT EXISTS idx_oncall_range ON oncall(start, end);
 """
 
@@ -143,6 +147,62 @@ with db() as _c:
     SECRET = get_setting(_c, "secret")
 
 app = FastAPI(title="Shiftboard", docs_url=None, redoc_url=None)
+
+# ---------------------------------------------------------------- backups
+BACKUP_DIR = Path(os.environ.get("BACKUP_DIR") or Path(DB_PATH).parent / "backups")
+BACKUP_KEEP = int(os.environ.get("BACKUP_KEEP", "30"))
+BACKUP_NAME = re.compile(r"^shiftboard-\d{4}-\d{2}-\d{2}-\d{4,6}(-[a-z]+)?\.db$")
+_backup_lock = threading.Lock()
+
+
+def make_backup(tag: str = "") -> Path:
+    """Consistent copy of the live database using SQLite's online backup API."""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    name = f"shiftboard-{datetime.now(TZ):%Y-%m-%d-%H%M%S}{'-' + tag if tag else ''}.db"
+    dest = BACKUP_DIR / name
+    with _backup_lock:
+        src = sqlite3.connect(DB_PATH)
+        out = sqlite3.connect(dest)
+        try:
+            src.backup(out)
+        finally:
+            out.close()
+            src.close()
+    prune_backups()
+    return dest
+
+
+def list_backups() -> list[Path]:
+    if not BACKUP_DIR.exists():
+        return []
+    return sorted((p for p in BACKUP_DIR.iterdir() if BACKUP_NAME.match(p.name)), key=lambda p: p.name, reverse=True)
+
+
+def prune_backups():
+    auto = [p for p in list_backups() if not p.name.endswith("-prerestore.db")]
+    for p in auto[BACKUP_KEEP:]:
+        p.unlink(missing_ok=True)
+    pre = [p for p in list_backups() if p.name.endswith("-prerestore.db")]
+    for p in pre[5:]:
+        p.unlink(missing_ok=True)
+
+
+def _backup_loop():
+    """Once a day (checked hourly): take a backup if none exists for today."""
+    import time as _t
+    while True:
+        try:
+            today = f"shiftboard-{datetime.now(TZ):%Y-%m-%d}"
+            if not any(p.name.startswith(today) for p in list_backups()):
+                make_backup()
+        except Exception as e:  # never let the backup thread die
+            print("backup failed:", e, flush=True)
+        _t.sleep(3600)
+
+
+@app.on_event("startup")
+def _start_backups():
+    threading.Thread(target=_backup_loop, daemon=True, name="backups").start()
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
@@ -589,7 +649,13 @@ def pay_for(c, start: date, ps: dict) -> dict:
     hi = f"{(end + timedelta(days=1)).isoformat()}T00:00"
     lo = f"{(start - timedelta(days=60)).isoformat()}T00:00"
     oncall = [dict(r) for r in c.execute("SELECT * FROM oncall WHERE end > ? AND start < ?", (lo, hi))]
-    return paycalc.compute(start, shifts, assignments, extras, oncall, ps)
+    out = paycalc.compute(start, shifts, assignments, extras, oncall, ps)
+    row = c.execute("SELECT gross, note FROM payslips WHERE period_start=?", (start.isoformat(),)).fetchone()
+    out["payslip"] = None
+    if row:
+        out["payslip"] = {"gross": row["gross"], "note": row["note"],
+                          "difference": round(row["gross"] - out.get("gross", 0), 2)}
+    return out
 
 
 @app.get("/api/pay", dependencies=[Depends(require_auth)])
@@ -706,6 +772,110 @@ def import_apply(p: ImportApplyIn):
         saved.update({k[:40]: v[:20] for k, v in p.aliases.items()})
         set_setting(c, "import_aliases", json.dumps(saved))
     return {"assigned": n, "oncall": oc}
+
+
+# ---------------------------------------------------------------- backup endpoints
+def _backup_info(p: Path) -> dict:
+    st = p.stat()
+    return {"name": p.name, "size": st.st_size,
+            "created": datetime.fromtimestamp(st.st_mtime, TZ).strftime("%Y-%m-%dT%H:%M")}
+
+
+@app.get("/api/backups", dependencies=[Depends(require_auth)])
+def get_backups():
+    return {"dir": str(BACKUP_DIR), "keep": BACKUP_KEEP, "backups": [_backup_info(p) for p in list_backups()]}
+
+
+@app.post("/api/backups", dependencies=[Depends(require_auth)])
+def backup_now():
+    return _backup_info(make_backup())
+
+
+@app.get("/api/backups/{name}", dependencies=[Depends(require_auth)])
+def download_backup(name: str):
+    if not BACKUP_NAME.match(name) or not (BACKUP_DIR / name).exists():
+        raise HTTPException(404, "Not found")
+    return FileResponse(BACKUP_DIR / name, media_type="application/octet-stream", filename=name)
+
+
+@app.get("/api/backup/download", dependencies=[Depends(require_auth)])
+def download_fresh_backup():
+    p = make_backup()
+    return FileResponse(p, media_type="application/octet-stream", filename=p.name)
+
+
+REQUIRED_TABLES = {"shifts", "assignments", "oncall", "settings"}
+
+
+@app.post("/api/backup/restore", dependencies=[Depends(require_auth)])
+async def restore_backup(file: UploadFile = File(...)):
+    data = await file.read()
+    if not data.startswith(b"SQLite format 3\x00"):
+        raise HTTPException(400, "That isn't a Shiftboard backup (.db) file")
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+        tf.write(data)
+        tmp = tf.name
+    try:
+        chk = sqlite3.connect(tmp)
+        try:
+            ok = chk.execute("PRAGMA integrity_check").fetchone()[0]
+            tables = {r[0] for r in chk.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            chk.close()
+        if ok != "ok" or not REQUIRED_TABLES <= tables:
+            raise HTTPException(400, "That backup is damaged or isn't from Shiftboard")
+        safety = make_backup("prerestore")
+        with _backup_lock:
+            src = sqlite3.connect(tmp)
+            dst = sqlite3.connect(DB_PATH)
+            try:
+                src.backup(dst)
+            finally:
+                src.close()
+                dst.close()
+        init_db()  # bring older backups up to the current schema
+    finally:
+        os.unlink(tmp)
+    return {"ok": True, "safety_copy": safety.name}
+
+
+# ---------------------------------------------------------------- payslips
+class PayslipIn(BaseModel):
+    gross: float = Field(ge=0, le=100000)
+    note: Optional[str] = Field(default=None, max_length=300)
+
+
+@app.put("/api/payslips/{period_start}", dependencies=[Depends(require_auth)])
+def put_payslip(period_start: date, p: PayslipIn):
+    with db() as c:
+        start = paycalc.fortnight_containing(period_start, pay_settings(c))
+        c.execute("INSERT INTO payslips(period_start,gross,note) VALUES(?,?,?) "
+                  "ON CONFLICT(period_start) DO UPDATE SET gross=excluded.gross, note=excluded.note",
+                  (start.isoformat(), p.gross, p.note))
+    return {"ok": True, "period_start": start.isoformat()}
+
+
+@app.delete("/api/payslips/{period_start}", dependencies=[Depends(require_auth)])
+def delete_payslip(period_start: date):
+    with db() as c:
+        start = paycalc.fortnight_containing(period_start, pay_settings(c))
+        c.execute("DELETE FROM payslips WHERE period_start=?", (start.isoformat(),))
+    return {"ok": True}
+
+
+@app.get("/api/payslips", dependencies=[Depends(require_auth)])
+def payslip_history(limit: int = 12):
+    with db() as c:
+        ps = pay_settings(c)
+        rows = c.execute("SELECT period_start FROM payslips ORDER BY period_start DESC LIMIT ?",
+                         (max(1, min(limit, 60)),)).fetchall()
+        out = []
+        for r in rows:
+            f = pay_for(c, date.fromisoformat(r[0]), ps)
+            out.append({"start": f["start"], "end": f["end"], "estimate": f.get("gross", 0),
+                        "payslip": f["payslip"]["gross"], "difference": f["payslip"]["difference"],
+                        "note": f["payslip"]["note"]})
+    return {"history": out}
 
 
 # ---------------------------------------------------------------- settings / sharing

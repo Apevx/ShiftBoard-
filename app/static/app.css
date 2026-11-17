@@ -181,3 +181,15 @@ body:not(.share) .share-only { display: none !important; }
 .maprow .cnt { color: var(--muted); font-size: 12px; min-width: 34px; }
 .maprow select { flex: 1; padding: 7px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
 .maprow.unset select { border-color: #f59e0b; }
+
+.slipdiff { font-size: 14px; margin: 0 0 6px; }
+.slipdiff.ok { color: #16a34a; }
+.slipdiff.warn { color: #b45309; }
+.slipdiff b { font-weight: 750; }
+.hist { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }
+.hist th { text-align: left; color: var(--muted); font-weight: 600; font-size: 12px; padding: 4px 2px; border-bottom: 1px solid var(--line); }
+.hist td { padding: 6px 2px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+.hist td.r, .hist th.r { text-align: right; }
+.hist .neg { color: #b45309; } .hist .pos { color: #16a34a; }
+.bkrow { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+.bkrow a { color: var(--accent); font-weight: 600; text-decoration: none; }
