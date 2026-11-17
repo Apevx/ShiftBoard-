@@ -20,7 +20,11 @@ Then open `http://<homelab-ip>:8085`. Data is stored in `./data/shiftboard.db` (
 - **On call:** pick **On call**, tap the first day, then tap the last day. Set the times (it remembers your last ones, e.g. 17:00 → 08:00) and save. It shows as an amber bar under each day it covers. You can also add on-call from the day sheet.
 - **Rotation (Settings → Rotation):** build a repeating pattern such as `D D N N – – – –` and apply it to a date range. You can still tweak individual days afterwards.
 - **Shifts (Settings → Shifts):** add or edit shift types: name, short code, colour, start/end time (overnight is handled), or all-day for leave/training. Deleting a shift that's already on the calendar only hides it, so your history stays.
-- The header shows totals for the month: shift count, hours, on-call hours and a count for each shift type.
+- **Pay (Settings → Pay):** choose your radiographer level and a pay fortnight start date (copy it from a payslip). The header then shows this fortnight's **overtime**, **called-in** and **on-call** pay plus estimated gross; tap it for the full breakdown and to step through other fortnights.
+- **Called in / remote recall / overtime:** open a day and use **+ Called in**, **+ Remote** or **+ Overtime**. Days with extra work get a red badge (C, R or OT).
+- Each shift type has a *Pays as* setting (ordinary, overtime, paid leave, unpaid) and an unpaid meal break, so paid hours are right.
+
+Pay rules follow the NSW Health *Medical Radiation Scientists (State) Award 2025* (rates) and *Conditions of Employment (State) Award 2025* (penalties, overtime cl 9, on-call cl 10, shift and weekend penalties cl 11, public holidays cl 15). Full rules are under Settings → Pay → *How it's calculated*. It's an estimate of gross pay; check it against your payslip.
 - Swipe left/right (or use the arrow keys) to change month.
 
 ## Sharing

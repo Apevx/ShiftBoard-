@@ -27,7 +27,7 @@
     <div class="month-label" id="monthLabel"></div>
     <button class="nav" id="nextBtn" aria-label="Next month">›</button>
   </div>
-  <div class="summary" id="summary"></div>
+  <button class="paystrip owner" id="payStrip" type="button"></button>
 </header>
 
 <main>
@@ -48,6 +48,15 @@
     <section class="owner">
       <div class="label">Set shift</div>
       <div class="chip-picker" id="dayPicker"></div>
+    </section>
+    <section class="owner">
+      <div class="label">Extra work</div>
+      <div id="dayExtras"></div>
+      <div class="row gap tight">
+        <button class="ghost sm" data-addx="callin">+ Called in</button>
+        <button class="ghost sm" data-addx="remote">+ Remote</button>
+        <button class="ghost sm" data-addx="overtime">+ Overtime</button>
+      </div>
     </section>
     <section>
       <div class="label row">On call <button class="link owner" id="dayAddOncall">+ Add</button></div>
@@ -83,6 +92,44 @@
   </form>
 </dialog>
 
+<!-- Extra work editor -->
+<dialog id="xDlg" class="sheet">
+  <form method="dialog" class="sheet-head"><h2 id="xTitle">Extra work</h2><button class="x" aria-label="Close">✕</button></form>
+  <form class="sheet-body form" id="xForm">
+    <div class="seg" id="xKind">
+      <button type="button" data-k="callin">Called in</button>
+      <button type="button" data-k="remote">Remote</button>
+      <button type="button" data-k="overtime">Overtime</button>
+    </div>
+    <p class="muted small" id="xHelp"></p>
+    <label>Date <input type="date" name="day" required></label>
+    <div class="two">
+      <label>Start <input type="time" name="start" required></label>
+      <label>Finish <input type="time" name="end" required></label>
+    </div>
+    <div class="muted small" id="xHours"></div>
+    <label>Note <textarea name="note" rows="2" placeholder="e.g. trauma CT, ED portable"></textarea></label>
+    <div class="actions">
+      <button type="button" class="danger" id="xDelete">Delete</button>
+      <span class="spacer"></span>
+      <button type="submit" class="primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Pay breakdown -->
+<dialog id="payDlg" class="sheet">
+  <form method="dialog" class="sheet-head"><h2>Pay estimate</h2><button class="x" aria-label="Close">✕</button></form>
+  <div class="sheet-body">
+    <div class="month-row compact">
+      <button class="nav" id="payPrev" aria-label="Previous fortnight">‹</button>
+      <div class="fn-label" id="payRange"></div>
+      <button class="nav" id="payNext" aria-label="Next fortnight">›</button>
+    </div>
+    <div id="payBody"></div>
+  </div>
+</dialog>
+
 <!-- Shift editor -->
 <dialog id="shiftDlg" class="sheet">
   <form method="dialog" class="sheet-head"><h2 id="shiftTitle">Shift</h2><button class="x" aria-label="Close">✕</button></form>
@@ -96,7 +143,17 @@
       <label>Start <input type="time" name="start_time"></label>
       <label>End <input type="time" name="end_time"></label>
     </div>
+    <label class="times">Unpaid meal break (minutes) <input type="number" name="break_mins" min="0" max="240" step="5"></label>
     <div class="muted small" id="shiftHours"></div>
+    <label>Pays as
+      <select name="pay_type">
+        <option value="ordinary">Ordinary rostered hours</option>
+        <option value="overtime">Overtime</option>
+        <option value="leave">Paid leave (base rate)</option>
+        <option value="unpaid">Unpaid / day off</option>
+      </select>
+    </label>
+    <label class="allday-only">Paid hours <input type="number" name="paid_hours" min="0" max="24" step="0.25"></label>
     <label>Colour <input type="color" name="color"></label>
     <div class="swatches" id="swatches"></div>
     <div class="actions">
@@ -113,6 +170,7 @@
   <nav class="tabs" id="tabs">
     <button data-tab="shifts" class="on">Shifts</button>
     <button data-tab="rotation">Rotation</button>
+    <button data-tab="pay">Pay</button>
     <button data-tab="share">Share</button>
     <button data-tab="general">General</button>
   </nav>
@@ -141,6 +199,37 @@
         <button class="primary block" id="patApply">Apply rotation</button>
         <button class="ghost block" id="clearRange">Clear all shifts in this range</button>
       </div>
+    </section>
+
+    <section data-pane="pay" hidden>
+      <form class="form" id="payForm">
+        <label>Classification (Radiographer, 35 hr week)
+          <select name="classification" id="payClass"><option value="">— choose your level —</option></select>
+        </label>
+        <div class="muted small" id="payRateInfo"></div>
+        <label>Custom base hourly rate <span class="muted">(optional, overrides the above)</span>
+          <input type="number" name="hourly_override" min="0" step="0.01" placeholder="e.g. 57.47"></label>
+        <label>A date a pay fortnight starts on
+          <input type="date" name="fortnight_start" required></label>
+        <p class="muted small">Copy the period start date from a payslip so fortnights line up with your pay.</p>
+        <label>Extra public holidays <span class="muted">(dates, comma separated)</span>
+          <input name="extra_holidays" placeholder="2026-12-31"></label>
+        <label>Ignore these public holidays <span class="muted">(dates, comma separated)</span>
+          <input name="not_holidays" placeholder=""></label>
+        <button class="primary block" type="submit">Save</button>
+      </form>
+      <details class="muted small rules">
+        <summary>How it's calculated</summary>
+        <ul>
+          <li>Base rate = weekly rate ÷ 35 (Medical Radiation Scientists Award 2025). July 2026 rates apply from the first full pay period starting on or after 1 July 2026.</li>
+          <li>Mon–Fri shift allowance by start time: 10:00–12:59 10%, 13:00–15:59 12.5%, 16:00–03:59 15%, 04:00–05:59 10%.</li>
+          <li>Saturday hours ×1.5, Sunday ×1.75 (in place of shift allowance). NSW public holidays +150%.</li>
+          <li>Overtime ×1.5 for the first 2 h each day then ×2; Sunday ×2; public holiday ×2.5.</li>
+          <li>Called in: minimum 4 h at overtime rates. Remote recall: minimum 1 h.</li>
+          <li>On call: one allowance per 24 h or part — $31.45 if rostered on that day, $61.99 if rostered off (July 2026 rates).</li>
+          <li>Gross only — before tax, super and salary packaging. Check against your payslip.</li>
+        </ul>
+      </details>
     </section>
 
     <section data-pane="share" hidden>

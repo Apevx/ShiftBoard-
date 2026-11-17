@@ -4,6 +4,7 @@ FastAPI + SQLite. Serves a single-page UI, a read-only share page and an
 iCalendar (.ics) feed that phones / Google / Outlook / Home Assistant can subscribe to.
 """
 import hashlib
+import json
 import hmac
 import os
 import secrets
@@ -18,6 +19,8 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+
+from . import pay as paycalc
 
 DB_PATH = os.environ.get("DB_PATH", "/data/shiftboard.db")
 TZ_NAME = os.environ.get("TZ", "Australia/Sydney")
@@ -37,7 +40,10 @@ CREATE TABLE IF NOT EXISTS shifts(
   start_time TEXT,
   end_time TEXT,
   sort INTEGER NOT NULL DEFAULT 0,
-  archived INTEGER NOT NULL DEFAULT 0
+  archived INTEGER NOT NULL DEFAULT 0,
+  pay_type TEXT NOT NULL DEFAULT 'ordinary',
+  break_mins INTEGER NOT NULL DEFAULT 0,
+  paid_hours REAL NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS assignments(
   day TEXT NOT NULL,
@@ -52,16 +58,26 @@ CREATE TABLE IF NOT EXISTS oncall(
   color TEXT NOT NULL DEFAULT '#f59e0b',
   note TEXT
 );
+CREATE TABLE IF NOT EXISTS extras(
+  id INTEGER PRIMARY KEY,
+  day TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  start TEXT NOT NULL,
+  end TEXT NOT NULL,
+  note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_extras_day ON extras(day);
 CREATE TABLE IF NOT EXISTS notes(day TEXT PRIMARY KEY, text TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS idx_oncall_range ON oncall(start, end);
 """
 
+# name, code, colour, all_day, start, end, pay_type, unpaid break mins, paid hours (all-day)
 DEFAULT_SHIFTS = [
-    ("Day", "D", "#3b82f6", 0, "07:00", "15:30"),
-    ("Afternoon", "A", "#8b5cf6", 0, "15:00", "23:30"),
-    ("Night", "N", "#1e3a8a", 0, "23:00", "07:30"),
-    ("Leave", "L", "#16a34a", 1, None, None),
+    ("Day", "D", "#3b82f6", 0, "07:00", "15:30", "ordinary", 30, 0),
+    ("Afternoon", "A", "#8b5cf6", 0, "15:00", "23:30", "ordinary", 30, 0),
+    ("Night", "N", "#1e3a8a", 0, "23:00", "07:30", "ordinary", 30, 0),
+    ("Leave", "L", "#16a34a", 1, None, None, "leave", 0, 7),
 ]
 
 
@@ -95,6 +111,13 @@ def init_db():
     with db() as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(SCHEMA)
+        cols = {r[1] for r in c.execute("PRAGMA table_info(shifts)")}
+        if "pay_type" not in cols:  # migrate databases from before pay tracking
+            c.execute("ALTER TABLE shifts ADD COLUMN pay_type TEXT NOT NULL DEFAULT 'ordinary'")
+            c.execute("ALTER TABLE shifts ADD COLUMN break_mins INTEGER NOT NULL DEFAULT 0")
+            c.execute("ALTER TABLE shifts ADD COLUMN paid_hours REAL NOT NULL DEFAULT 0")
+            c.execute("UPDATE shifts SET break_mins=30 WHERE all_day=0")
+            c.execute("UPDATE shifts SET pay_type='leave', paid_hours=7 WHERE all_day=1")
         if get_setting(c, "secret") is None:
             set_setting(c, "secret", secrets.token_hex(32))
         if get_setting(c, "share_token") is None:
@@ -104,8 +127,8 @@ def init_db():
         if get_setting(c, "seeded") is None:
             for i, s in enumerate(DEFAULT_SHIFTS):
                 c.execute(
-                    "INSERT INTO shifts(name,code,color,all_day,start_time,end_time,sort) "
-                    "VALUES(?,?,?,?,?,?,?)",
+                    "INSERT INTO shifts(name,code,color,all_day,start_time,end_time,pay_type,break_mins,paid_hours,sort) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (*s, i),
                 )
             set_setting(c, "seeded", "1")
@@ -171,7 +194,7 @@ def shift_hours(row) -> float:
     sh, sm = map(int, row["start_time"].split(":"))
     eh, em = map(int, row["end_time"].split(":"))
     mins = ((eh * 60 + em) - (sh * 60 + sm)) % 1440 or 1440
-    return round(mins / 60, 2)
+    return round(max(0, mins - (row["break_mins"] or 0)) / 60, 2)
 
 
 def shift_dict(r) -> dict:
@@ -215,6 +238,13 @@ def load_state(c, start: date, end: date, public: bool) -> dict:
         for o in out["oncall"]:
             o.pop("note", None)
     else:
+        out["extras"] = [
+            dict(r)
+            for r in c.execute(
+                "SELECT * FROM extras WHERE day BETWEEN ? AND ? ORDER BY day, start",
+                (start.isoformat(), end.isoformat()),
+            )
+        ]
         out["notes"] = {
             r["day"]: r["text"]
             for r in c.execute(
@@ -256,6 +286,9 @@ class ShiftIn(BaseModel):
     start_time: Optional[str] = Field(default=None, pattern=HHMM)
     end_time: Optional[str] = Field(default=None, pattern=HHMM)
     archived: bool = False
+    pay_type: Literal["ordinary", "overtime", "leave", "unpaid"] = "ordinary"
+    break_mins: int = Field(default=0, ge=0, le=240)
+    paid_hours: float = Field(default=0, ge=0, le=24)
 
 
 def _validate_shift(s: ShiftIn):
@@ -263,6 +296,9 @@ def _validate_shift(s: ShiftIn):
         raise HTTPException(400, "Timed shifts need a start and end time")
     if s.all_day:
         s.start_time = s.end_time = None
+        s.break_mins = 0
+    else:
+        s.paid_hours = 0
 
 
 @app.post("/api/shifts", dependencies=[Depends(require_auth)])
@@ -271,8 +307,10 @@ def create_shift(s: ShiftIn):
     with db() as c:
         sort = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM shifts").fetchone()[0]
         cur = c.execute(
-            "INSERT INTO shifts(name,code,color,all_day,start_time,end_time,sort) VALUES(?,?,?,?,?,?,?)",
-            (s.name.strip(), s.code.strip(), s.color, int(s.all_day), s.start_time, s.end_time, sort),
+            "INSERT INTO shifts(name,code,color,all_day,start_time,end_time,pay_type,break_mins,paid_hours,sort) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (s.name.strip(), s.code.strip(), s.color, int(s.all_day), s.start_time, s.end_time,
+             s.pay_type, s.break_mins, s.paid_hours, sort),
         )
         return shift_dict(c.execute("SELECT * FROM shifts WHERE id=?", (cur.lastrowid,)).fetchone())
 
@@ -282,8 +320,10 @@ def update_shift(sid: int, s: ShiftIn):
     _validate_shift(s)
     with db() as c:
         cur = c.execute(
-            "UPDATE shifts SET name=?,code=?,color=?,all_day=?,start_time=?,end_time=?,archived=? WHERE id=?",
-            (s.name.strip(), s.code.strip(), s.color, int(s.all_day), s.start_time, s.end_time, int(s.archived), sid),
+            "UPDATE shifts SET name=?,code=?,color=?,all_day=?,start_time=?,end_time=?,archived=?,"
+            "pay_type=?,break_mins=?,paid_hours=? WHERE id=?",
+            (s.name.strip(), s.code.strip(), s.color, int(s.all_day), s.start_time, s.end_time, int(s.archived),
+             s.pay_type, s.break_mins, s.paid_hours, sid),
         )
         if not cur.rowcount:
             raise HTTPException(404, "Shift not found")
@@ -442,6 +482,103 @@ def delete_oncall(oid: int):
     with db() as c:
         c.execute("DELETE FROM oncall WHERE id=?", (oid,))
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- extra work (call-ins, recall, overtime)
+class ExtraIn(BaseModel):
+    day: date
+    kind: Literal["callin", "remote", "overtime"] = "callin"
+    start: str = Field(pattern=HHMM)
+    end: str = Field(pattern=HHMM)
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+@app.post("/api/extras", dependencies=[Depends(require_auth)])
+def create_extra(x: ExtraIn):
+    if x.start == x.end:
+        raise HTTPException(400, "Start and end can't be the same")
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO extras(day,kind,start,end,note) VALUES(?,?,?,?,?)",
+            (x.day.isoformat(), x.kind, x.start, x.end, x.note),
+        )
+        return dict(c.execute("SELECT * FROM extras WHERE id=?", (cur.lastrowid,)).fetchone())
+
+
+@app.put("/api/extras/{xid}", dependencies=[Depends(require_auth)])
+def update_extra(xid: int, x: ExtraIn):
+    if x.start == x.end:
+        raise HTTPException(400, "Start and end can't be the same")
+    with db() as c:
+        cur = c.execute(
+            "UPDATE extras SET day=?,kind=?,start=?,end=?,note=? WHERE id=?",
+            (x.day.isoformat(), x.kind, x.start, x.end, x.note, xid),
+        )
+        if not cur.rowcount:
+            raise HTTPException(404, "Not found")
+        return dict(c.execute("SELECT * FROM extras WHERE id=?", (xid,)).fetchone())
+
+
+@app.delete("/api/extras/{xid}", dependencies=[Depends(require_auth)])
+def delete_extra(xid: int):
+    with db() as c:
+        c.execute("DELETE FROM extras WHERE id=?", (xid,))
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- pay
+def pay_settings(c) -> dict:
+    s = dict(paycalc.DEFAULT_SETTINGS)
+    raw = get_setting(c, "pay")
+    if raw:
+        try:
+            s.update(json.loads(raw))
+        except ValueError:
+            pass
+    return s
+
+
+class PaySettingsIn(BaseModel):
+    classification: str = ""
+    hourly_override: Optional[float] = Field(default=None, ge=0, le=1000)
+    fortnight_start: date
+    extra_holidays: list[date] = []
+    not_holidays: list[date] = []
+
+
+@app.get("/api/pay-settings", dependencies=[Depends(require_auth)])
+def get_pay_settings():
+    with db() as c:
+        return {"settings": pay_settings(c), "classifications": paycalc.classifications(),
+                "sources": "Medical Radiation Scientists (State) Award 2025; Conditions of Employment (State) Award 2025"}
+
+
+@app.put("/api/pay-settings", dependencies=[Depends(require_auth)])
+def put_pay_settings(p: PaySettingsIn):
+    if p.classification and p.classification not in paycalc.RADIOGRAPHER:
+        raise HTTPException(400, "Unknown classification")
+    data = p.model_dump(mode="json")
+    with db() as c:
+        set_setting(c, "pay", json.dumps(data))
+    return {"ok": True}
+
+
+@app.get("/api/pay", dependencies=[Depends(require_auth)])
+def get_pay(on: Optional[date] = None):
+    with db() as c:
+        ps = pay_settings(c)
+        start = paycalc.fortnight_containing(on or datetime.now(TZ).date(), ps)
+        end = start + timedelta(days=13)
+        shifts = {r["id"]: dict(r) for r in c.execute("SELECT * FROM shifts")}
+        assignments = [dict(r) for r in c.execute(
+            "SELECT day, shift_id FROM assignments WHERE day BETWEEN ? AND ?", (start.isoformat(), end.isoformat()))]
+        extras = [dict(r) for r in c.execute(
+            "SELECT * FROM extras WHERE day BETWEEN ? AND ?", (start.isoformat(), end.isoformat()))]
+        hi = f"{(end + timedelta(days=1)).isoformat()}T00:00"
+        oncall = [dict(r) for r in c.execute(
+            "SELECT * FROM oncall WHERE end > ? AND start < ?",
+            ((start - timedelta(days=60)).isoformat() + "T00:00", hi))]
+    return paycalc.compute(start, shifts, assignments, extras, oncall, ps)
 
 
 # ---------------------------------------------------------------- settings / sharing

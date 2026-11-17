@@ -16,7 +16,7 @@ const ls = {
 };
 
 let cur = new Date(); cur = new Date(cur.getFullYear(), cur.getMonth(), 1);
-let S = { shifts: [], byId: {}, assign: {}, oncall: [], notes: {}, title: "" };
+let S = { shifts: [], byId: {}, assign: {}, oncall: [], notes: {}, extras: [], title: "", pay: null };
 let mode = { type: "view" };       // view | shift(id) | erase | oncall(first)
 let stack = false;                 // allow two shifts on one day
 let weekStartSun = ls.get("weekStartSun", false);
@@ -39,7 +39,19 @@ const cvars = hex => `--c:${hex};--fg:${fgFor(hex)}`;
 const fmtDay = s => { const d = parseYmd(s); return `${DOW[d.getDay()]} ${d.getDate()} ${MONTHS[d.getMonth()].slice(0, 3)}`; };
 const fmtHours = h => (Math.round(h * 10) / 10).toString();
 function fmtDT(s) { const [d, t] = s.split("T"); return `${fmtDay(d)} ${t}`; }
-function shiftTimes(s) { return s.all_day ? "All day" : `${s.start_time}–${s.end_time} · ${fmtHours(s.hours)}h`; }
+const PAYTYPE = { ordinary: "", overtime: " · overtime", leave: " · paid leave", unpaid: " · unpaid" };
+function shiftTimes(s) {
+  const base = s.all_day ? (s.paid_hours ? `All day · ${fmtHours(s.paid_hours)}h paid` : "All day") : `${s.start_time}–${s.end_time} · ${fmtHours(s.hours)}h paid`;
+  return base + (PAYTYPE[s.pay_type] || "");
+}
+const money = (v, cents = false) => "$" + Number(v || 0).toLocaleString("en-AU", { minimumFractionDigits: cents ? 2 : 0, maximumFractionDigits: cents ? 2 : 0 });
+const XKIND = { callin: "Called in", remote: "Remote recall", overtime: "Overtime" };
+const XHELP = {
+  callin: "Recalled to work while on call — paid at overtime rates, minimum 4 hours.",
+  remote: "Remote support or advice without coming in — overtime rates, minimum 1 hour.",
+  overtime: "Stayed back or extra hours — overtime rates for the time worked.",
+};
+const fmtShort = s => { const d = parseYmd(s); return `${d.getDate()} ${MONTHS[d.getMonth()].slice(0, 3)}`; };
 
 function toast(msg) {
   const t = $("#toast"); t.textContent = msg; t.classList.add("show");
@@ -71,11 +83,17 @@ async function load() {
   const { start, end } = gridRange();
   const q = `?start=${ymd(start)}&end=${ymd(end)}`;
   const data = await api(SHARE ? `/api/public/${SHARE}/state${q}` : `/api/state${q}`);
-  S = { ...S, ...data, notes: data.notes || {} };
+  S = { ...S, ...data, notes: data.notes || {}, extras: data.extras || [] };
   S.byId = Object.fromEntries(S.shifts.map(s => [s.id, s]));
   S.assign = {};
   for (const a of data.assignments) (S.assign[a.day] ||= []).push(a.shift_id);
   render();
+  if (!SHARE) loadPay();
+}
+
+async function loadPay() {
+  try { S.pay = await api(`/api/pay?on=${todayStr()}`); } catch { S.pay = null; }
+  renderPayStrip();
 }
 
 const sortIds = ids => [...ids].sort((a, b) => (S.byId[a]?.sort ?? 0) - (S.byId[b]?.sort ?? 0));
@@ -114,33 +132,31 @@ function render() {
       <div class="chips${ids.length > 1 ? " two" : ""}">${chips}</div>
       <div class="ocbars">${bars}</div>
       ${S.notes[day] ? '<span class="notedot"></span>' : ""}
+      ${xBadge(day)}
     </div>`;
   }
   $("#grid").innerHTML = html;
-  renderSummary();
-  if (!SHARE) renderPalette();
+  if (!SHARE) { renderPalette(); renderPayStrip(); }
 }
 
-function renderSummary() {
-  const y = cur.getFullYear(), m = cur.getMonth();
-  const days = new Date(y, m + 1, 0).getDate();
-  let hours = 0, worked = 0; const counts = {};
-  for (let d = 1; d <= days; d++) {
-    for (const id of S.assign[ymd(new Date(y, m, d))] || []) {
-      const s = S.byId[id]; if (!s) continue;
-      counts[id] = (counts[id] || 0) + 1;
-      if (!s.all_day) { hours += s.hours; worked++; }
-    }
-  }
-  const mS = new Date(y, m, 1), mE = new Date(y, m + 1, 1);
-  const ocH = S.oncall.reduce((t, o) => t + overlapHours(new Date(o.start), new Date(o.end), mS, mE), 0);
-  const minis = sortIds(Object.keys(counts).map(Number)).map(id => {
-    const s = S.byId[id]; return `<span class="mini" style="background:${s.color};color:${fgFor(s.color)}">${esc(s.code)}×${counts[id]}</span>`;
-  }).join("");
-  const parts = [];
-  if (worked) parts.push(`<b>${worked}</b> shifts · <b>${fmtHours(hours)}</b>h`);
-  if (ocH) parts.push(`<b>${fmtHours(ocH)}</b>h on call`);
-  $("#summary").innerHTML = parts.length || minis ? `${parts.join(" · ")}<div>${minis}</div>` : "No shifts this month";
+function xBadge(day) {
+  const xs = S.extras.filter(x => x.day === day);
+  if (!xs.length) return "";
+  const k = xs.some(x => x.kind === "callin") ? "C" : xs.some(x => x.kind === "remote") ? "R" : "OT";
+  return `<span class="xbadge" title="${xs.map(x => XKIND[x.kind]).join(", ")}">${k}${xs.length > 1 ? xs.length : ""}</span>`;
+}
+
+function renderPayStrip() {
+  const el = $("#payStrip"), p = S.pay;
+  if (!p) { el.innerHTML = ""; return; }
+  if (!p.configured) { el.innerHTML = `<div class="sub">Set your classification in <b>Settings › Pay</b> to see overtime & on-call pay</div>`; return; }
+  const ci = p.callin_count ? `<span><span class="k">Called in ×${p.callin_count}</span><b>${money(p.callin_pay)}</b></span>` : `<span><span class="k">Called in</span><b>$0</b></span>`;
+  el.innerHTML = `<div class="vals">
+      <span><span class="k">Overtime</span><b>${money(p.overtime_pay)}</b></span>
+      ${ci}
+      <span><span class="k">On call</span><b>${money(p.oncall_pay)}</b></span>
+    </div>
+    <div class="sub">Fortnight ${fmtShort(p.start)} – ${fmtShort(p.end)} · est. gross ${money(p.gross)} ›</div>`;
 }
 
 function renderPalette() {
@@ -254,7 +270,100 @@ function renderDay() {
       ${SHARE ? "" : "<span class=\"muted\">›</span>"}
     </div>`).join("") : '<div class="muted">None</div>';
   $("#dayNote").value = S.notes[day] || "";
+  if (!SHARE) {
+    const xs = S.extras.filter(x => x.day === day);
+    $("#dayExtras").innerHTML = xs.length ? xs.map(x => `
+      <div class="item" data-x="${x.id}" style="cursor:pointer">
+        <span class="oc-sw" style="--c:#dc2626"></span>
+        <div class="grow"><div class="t">${XKIND[x.kind]}</div><div class="s">${x.start}–${x.end}${x.note ? " · " + esc(x.note) : ""}</div></div>
+        <span class="muted">›</span></div>`).join("") : '<div class="muted">None</div>';
+  }
 }
+$("#dayExtras").addEventListener("click", e => {
+  const it = e.target.closest("[data-x]"); if (!it) return;
+  const x = S.extras.find(v => v.id === +it.dataset.x);
+  $("#dayDlg").close(); openExtra(x);
+});
+$$("[data-addx]").forEach(b => b.onclick = () => { const d = openDay; $("#dayDlg").close(); openExtra(null, d, b.dataset.addx); });
+
+/* ---------- extra work editor ---------- */
+let editingX = null, xKind = "callin";
+function setXKind(k) {
+  xKind = k;
+  $$("#xKind button").forEach(b => b.classList.toggle("on", b.dataset.k === k));
+  $("#xHelp").textContent = XHELP[k];
+  updateXHours();
+}
+function updateXHours() {
+  const f = $("#xForm");
+  if (!f.start.value || !f.end.value) return ($("#xHours").textContent = "");
+  const [a, b] = [f.start.value, f.end.value].map(t => { const [h, m] = t.split(":").map(Number); return h * 60 + m; });
+  const hrs = (((b - a) % 1440 + 1440) % 1440) / 60;
+  const min = { callin: 4, remote: 1, overtime: 0 }[xKind];
+  $("#xHours").textContent = `${fmtHours(hrs)} h worked${b <= a ? " (finishes next day)" : ""}` + (hrs < min ? ` · paid as ${min} h minimum` : "");
+}
+function openExtra(x, day, kind) {
+  editingX = x;
+  const f = $("#xForm"), last = ls.get("xDefaults", {});
+  $("#xTitle").textContent = x ? "Edit extra work" : "Add extra work";
+  $("#xDelete").hidden = !x;
+  const k = x?.kind || kind || "callin";
+  f.day.value = x?.day || day;
+  f.start.value = x?.start || last[k]?.start || (k === "overtime" ? "15:30" : "22:00");
+  f.end.value = x?.end || last[k]?.end || (k === "overtime" ? "16:30" : "23:30");
+  f.note.value = x?.note || "";
+  setXKind(k);
+  $("#xDlg").showModal();
+}
+$("#xKind").addEventListener("click", e => { const b = e.target.closest("[data-k]"); if (b) setXKind(b.dataset.k); });
+["start", "end"].forEach(n => $("#xForm")[n].addEventListener("input", updateXHours));
+$("#xForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const f = e.target;
+  const body = { day: f.day.value, kind: xKind, start: f.start.value, end: f.end.value, note: f.note.value.trim() || null };
+  await api(editingX ? `/api/extras/${editingX.id}` : "/api/extras", { method: editingX ? "PUT" : "POST", body });
+  const last = ls.get("xDefaults", {}); last[xKind] = { start: body.start, end: body.end }; ls.set("xDefaults", last);
+  $("#xDlg").close(); toast(`${XKIND[xKind]} saved`); load();
+});
+$("#xDelete").onclick = async () => {
+  if (!editingX || !confirm("Delete this entry?")) return;
+  await api(`/api/extras/${editingX.id}`, { method: "DELETE" });
+  $("#xDlg").close(); load();
+};
+
+/* ---------- pay breakdown ---------- */
+let payOn = null;
+$("#payStrip").onclick = () => {
+  if (S.pay && !S.pay.configured) { openSettings("pay"); return; }
+  payOn = todayStr(); showPay();
+};
+async function showPay() {
+  const p = await api(`/api/pay?on=${payOn}`);
+  $("#payRange").textContent = `${fmtShort(p.start)} – ${fmtShort(p.end)} ${parseYmd(p.end).getFullYear()}`;
+  const row = (label, sub, val) => `<tr><td>${label}${sub ? `<div class="s">${sub}</div>` : ""}</td><td class="r">${money(val, true)}</td></tr>`;
+  const pd = p.penalty_detail || {};
+  const pen = [["shift", "Shift allowance"], ["saturday", "Saturday"], ["sunday", "Sunday"], ["holiday", "Public holiday"]]
+    .filter(([k]) => pd[k]).map(([k, l]) => `<tr class="sub"><td>${l}</td><td class="r">${money(pd[k], true)}</td></tr>`).join("");
+  const xs = (p.extras || []).map(x => `<tr class="sub"><td>${fmtDay(x.day)} · ${XKIND[x.kind]} ${fmtHours(x.actual_hours)}h${x.paid_hours > x.actual_hours ? ` (paid ${fmtHours(x.paid_hours)}h)` : ""}</td><td class="r">${money(x.amount, true)}</td></tr>`).join("");
+  const hol = Object.entries(p.holidays || {}).map(([d, n]) => `${fmtDay(d)} ${esc(n)}`).join(", ");
+  $("#payBody").innerHTML = `
+    <p class="muted small">${esc(p.rate_label)} · ${money(p.hourly, true)}/h</p>
+    <table class="payrows">
+      ${row("Ordinary hours", `${fmtHours(p.ordinary_hours)} of ${p.contract_hours} h rostered`, p.ordinary_pay)}
+      ${row("Penalties", "", p.penalties)}${pen}
+      ${p.leave_hours ? row("Paid leave", `${fmtHours(p.leave_hours)} h`, p.leave_pay) : ""}
+      ${row("Overtime", `${fmtHours(p.overtime_hours)} h`, p.overtime_pay)}
+      ${row(`Called in / recall ×${p.callin_count}`, `${fmtHours(p.callin_hours)} h paid`, p.callin_pay)}
+      ${xs}
+      ${row(`On call ×${p.oncall_count}`, `${fmtHours(p.oncall_hours)} h on call · ${money(p.oncall_rates.on_duty, true)} rostered on / ${money(p.oncall_rates.off_duty, true)} off`, p.oncall_pay)}
+      <tr class="tot"><td>Estimated gross</td><td class="r">${money(p.gross, true)}</td></tr>
+    </table>
+    ${hol ? `<p class="muted small">Public holidays: ${hol}</p>` : ""}
+    <p class="muted small">Estimate before tax and super. Check against your payslip.</p>`;
+  if (!$("#payDlg").open) $("#payDlg").showModal();
+}
+$("#payPrev").onclick = () => { payOn = ymd(addDays(parseYmd(payOn), -14)); showPay(); };
+$("#payNext").onclick = () => { payOn = ymd(addDays(parseYmd(payOn), 14)); showPay(); };
 $("#dayShifts").addEventListener("click", e => {
   const b = e.target.closest("[data-rm]"); if (b) setDay(openDay, +b.dataset.rm, "remove");
 });
@@ -317,11 +426,46 @@ $("#ocDelete").onclick = async () => {
 };
 
 /* ---------- settings ---------- */
-$("#settingsBtn").onclick = () => { renderSettings(); $("#setDlg").showModal(); };
+function selectTab(name) {
+  $$("#tabs button").forEach(x => x.classList.toggle("on", x.dataset.tab === name));
+  $$("#setDlg [data-pane]").forEach(p => p.hidden = p.dataset.pane !== name);
+  if (name === "pay") loadPaySettings();
+}
+function openSettings(tab = "shifts") { renderSettings(); selectTab(tab); $("#setDlg").showModal(); }
+$("#settingsBtn").onclick = () => openSettings();
 $("#tabs").addEventListener("click", e => {
-  const b = e.target.closest("button[data-tab]"); if (!b) return;
-  $$("#tabs button").forEach(x => x.classList.toggle("on", x === b));
-  $$("#setDlg [data-pane]").forEach(p => p.hidden = p.dataset.pane !== b.dataset.tab);
+  const b = e.target.closest("button[data-tab]"); if (b) selectTab(b.dataset.tab);
+});
+
+/* pay settings */
+let PS = null;
+async function loadPaySettings() {
+  PS = await api("/api/pay-settings");
+  const f = $("#payForm"), st = PS.settings;
+  $("#payClass").innerHTML = '<option value="">— choose your level —</option>' +
+    PS.classifications.map(c => `<option value="${c.key}">${esc(c.label)}</option>`).join("");
+  f.classification.value = st.classification || "";
+  f.hourly_override.value = st.hourly_override ?? "";
+  f.fortnight_start.value = st.fortnight_start;
+  f.extra_holidays.value = (st.extra_holidays || []).join(", ");
+  f.not_holidays.value = (st.not_holidays || []).join(", ");
+  payRateInfo();
+}
+function payRateInfo() {
+  const c = PS?.classifications.find(x => x.key === $("#payClass").value);
+  $("#payRateInfo").textContent = c
+    ? `${money(c.weekly[1], true)}/week (from Jul 2026) = ${money(c.weekly[1] / 35, true)}/h · ${money(c.weekly[1] * 52.143)}/year`
+    : "";
+}
+$("#payClass").addEventListener("change", payRateInfo);
+const dateList = v => v.split(/[\s,]+/).map(x => x.trim()).filter(Boolean);
+$("#payForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const f = e.target;
+  const body = { classification: f.classification.value, hourly_override: f.hourly_override.value ? +f.hourly_override.value : null,
+    fortnight_start: f.fortnight_start.value, extra_holidays: dateList(f.extra_holidays.value), not_holidays: dateList(f.not_holidays.value) };
+  await api("/api/pay-settings", { method: "PUT", body });
+  toast("Pay settings saved"); loadPay();
 });
 
 function renderSettings() {
@@ -370,12 +514,14 @@ $("#newShift").onclick = () => openShift(null);
 let editingShift = null;
 function updateShiftHours() {
   const f = $("#shiftForm");
-  $(".times", f).hidden = f.all_day.checked;
+  $$(".times", f).forEach(el => el.hidden = f.all_day.checked);
+  $(".allday-only", f).hidden = !f.all_day.checked;
   let txt = "";
   if (!f.all_day.checked && f.start_time.value && f.end_time.value) {
     const [a, b] = [f.start_time.value, f.end_time.value].map(t => { const [h, m] = t.split(":").map(Number); return h * 60 + m; });
     const mins = ((b - a) % 1440 + 1440) % 1440 || 1440;
-    txt = `${fmtHours(mins / 60)} hours${b <= a ? " (finishes next day)" : ""}`;
+    const paid = Math.max(0, mins - (+f.break_mins.value || 0));
+    txt = `${fmtHours(paid / 60)} paid hours${b <= a ? " (finishes next day)" : ""}`;
   }
   $("#shiftHours").textContent = txt;
 }
@@ -388,17 +534,21 @@ function openShift(s) {
   f.all_day.checked = !!s?.all_day;
   f.start_time.value = s?.start_time || "07:00"; f.end_time.value = s?.end_time || "15:00";
   f.color.value = s?.color || SWATCHES[S.shifts.length % SWATCHES.length];
+  f.break_mins.value = s ? s.break_mins : 30;
+  f.pay_type.value = s?.pay_type || "ordinary";
+  f.paid_hours.value = s ? s.paid_hours : 0;
   $("#swatches").innerHTML = SWATCHES.map(c => `<button type="button" style="--c:${c}" data-c="${c}" aria-label="${c}"></button>`).join("");
   updateShiftHours();
   $("#shiftDlg").showModal();
 }
 $("#swatches").addEventListener("click", e => { const b = e.target.closest("[data-c]"); if (b) $("#shiftForm").color.value = b.dataset.c; });
-["all_day", "start_time", "end_time"].forEach(n => $("#shiftForm")[n].addEventListener("input", updateShiftHours));
+["all_day", "start_time", "end_time", "break_mins"].forEach(n => $("#shiftForm")[n].addEventListener("input", updateShiftHours));
 $("#shiftForm").addEventListener("submit", async e => {
   e.preventDefault();
   const f = e.target;
   const body = { name: f.name.value.trim(), code: f.code.value.trim(), color: f.color.value, all_day: f.all_day.checked,
-    start_time: f.all_day.checked ? null : f.start_time.value, end_time: f.all_day.checked ? null : f.end_time.value };
+    start_time: f.all_day.checked ? null : f.start_time.value, end_time: f.all_day.checked ? null : f.end_time.value,
+    pay_type: f.pay_type.value, break_mins: +f.break_mins.value || 0, paid_hours: +f.paid_hours.value || 0 };
   await api(editingShift ? `/api/shifts/${editingShift.id}` : "/api/shifts", { method: editingShift ? "PUT" : "POST", body });
   $("#shiftDlg").close(); await load(); renderSettings();
 });
