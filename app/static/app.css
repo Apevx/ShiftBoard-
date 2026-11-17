@@ -193,3 +193,6 @@ body:not(.share) .share-only { display: none !important; }
 .hist .neg { color: #b45309; } .hist .pos { color: #16a34a; }
 .bkrow { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
 .bkrow a { color: var(--accent); font-weight: 600; text-decoration: none; }
+
+#impText { font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: pre; overflow-x: auto; }
+.filelink { display: block; text-align: center; margin: 8px 0 4px; cursor: pointer; color: var(--accent); font-weight: 600; }

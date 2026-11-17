@@ -249,8 +249,14 @@
 
     <section data-pane="files" hidden>
       <div class="label">Import roster</div>
-      <p class="muted small">Upload the Excel (.xlsx/.xls) or CSV roster extract. Codes are matched to your shift codes; anything new you map once is remembered.</p>
-      <label class="filebtn ghost">Choose roster file…<input type="file" id="impFile" accept=".xlsx,.xlsm,.xls,.csv,.txt" hidden></label>
+      <p class="muted small">In the roster spreadsheet, select the <b>row of dates</b> and <b>your row of shifts</b> (or the whole roster), copy, and paste below. Codes are matched to your shift codes; anything new you map once is remembered.</p>
+      <div class="form">
+        <textarea id="impText" rows="5" placeholder="Paste roster cells here"></textarea>
+        <label style="margin-top:8px">First date <span class="muted">(only if you didn't copy the dates)</span>
+          <input type="date" id="impFirst"></label>
+        <button class="primary block" id="impRead" type="button">Read roster</button>
+      </div>
+      <label class="link small filelink">or upload the spreadsheet file<input type="file" id="impFile" accept=".xlsx,.xlsm,.xls,.csv,.txt" hidden></label>
       <div id="impStep" hidden>
         <div class="form">
           <label>Whose roster <select id="impSeries"></select></label>

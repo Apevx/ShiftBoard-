@@ -726,6 +726,25 @@ async def import_preview(file: UploadFile = File(...)):
     return {"series": series, "aliases": aliases, "filename": file.filename}
 
 
+class PasteIn(BaseModel):
+    text: str = Field(min_length=1, max_length=500_000)
+    first_date: Optional[date] = None
+
+
+@app.post("/api/import/paste", dependencies=[Depends(require_auth)])
+def import_paste(p: PasteIn):
+    sheets = importer.read_text(p.text)
+    series = importer.find_series(sheets, datetime.now(TZ).date())
+    if not series and p.first_date:
+        series = importer.series_from_first_date(sheets, p.first_date)
+    if not series:
+        raise HTTPException(400, "No dates found. Copy the row of dates along with your shifts, "
+                                 "or enter the date of the first day you copied.")
+    with db() as c:
+        aliases = json.loads(get_setting(c, "import_aliases") or "{}")
+    return {"series": series, "aliases": aliases, "filename": None}
+
+
 class ImportItem(BaseModel):
     day: date
     shift_id: int

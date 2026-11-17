@@ -30,7 +30,7 @@ Pay rules follow the NSW Health *Medical Radiation Scientists (State) Award 2025
 
 ## Import & export (Settings → Files)
 
-- **Import roster:** upload the Excel (.xlsx/.xls) or CSV extract. It finds the dates (a header row of dates with a row per person, or a column of dates), lets you pick your row, and matches each code to your shift codes, shift times (e.g. `0700-1530`) or on call. Map any unknown codes once (e.g. `AL` → Leave, `RDO` → ignore) and they're remembered. Cells like `D/OC` add both. Imported on-call uses your last on-call times. Existing shifts in the roster period are replaced unless you untick it.
+- **Import roster:** in the roster spreadsheet, copy the row of dates plus your row (or the whole roster) and paste it into the box. If you only copy your codes, enter the first date. You can still upload the Excel (.xlsx/.xls) or CSV file instead. It finds the dates (a header row of dates with a row per person, or a column of dates), lets you pick your row, and matches each code to your shift codes, shift times (e.g. `0700-1530`) or on call. Map any unknown codes once (e.g. `AL` → Leave, `RDO` → ignore) and they're remembered. Cells like `D/OC` add both. Imported on-call uses your last on-call times. Existing shifts in the roster period are replaced unless you untick it.
 - **Calendar PDF:** the **PDF** button in the header downloads the month on screen (A4 landscape, shift times, overtime, call-ins, on call, notes, legend and totals). Pick another month in Settings → Files.
 - **Hours & pay spreadsheet:** this month, last month, this/last financial year or a custom range. Sheets: Summary, Shifts (paid hours, penalties, base/penalty/total pay per shift), Extra work, On call, Fortnights.
 

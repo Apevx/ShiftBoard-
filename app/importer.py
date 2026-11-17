@@ -132,6 +132,39 @@ def _read_csv(data: bytes) -> list[tuple[str, list[list]]]:
     return [("CSV", [[c if c != "" else None for c in r] for r in rows])]
 
 
+def read_text(txt: str) -> list[tuple[str, list[list]]]:
+    """Text pasted from a spreadsheet: tab-separated (Excel/Sheets/Numbers), or CSV."""
+    txt = txt.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    delim = "\t" if "\t" in txt else None
+    if delim is None:
+        try:
+            delim = csv.Sniffer().sniff(txt[:4096], delimiters=",;").delimiter
+        except csv.Error:
+            delim = "\t"
+    rows = [row[:MAX_COLS] for _, row in zip(range(MAX_ROWS), csv.reader(io.StringIO(txt), delimiter=delim))]
+    return [("Pasted", [[c.strip() if c.strip() != "" else None for c in r] for r in rows])]
+
+
+def series_from_first_date(sheets, first: date) -> list[dict]:
+    """No dates in the paste: each line is a run of consecutive days starting at `first`."""
+    out = []
+    for sheet, rows in sheets:
+        for i, row in enumerate(rows):
+            cells = {}
+            for j, v in enumerate(row):
+                t = text(v)
+                if t:
+                    cells[(first + timedelta(days=j)).isoformat()] = t
+            if not cells:
+                continue
+            days = sorted(cells)
+            preview = " ".join(text(v) or "·" for v in row[:8])
+            out.append({"id": len(out), "sheet": sheet, "label": f"Line {i + 1}: {preview}"[:80], "layout": "line",
+                        "cells": cells, "count": len(days), "start": first.isoformat(),
+                        "end": (first + timedelta(days=len(row) - 1)).isoformat()})
+    return out
+
+
 def read_book(data: bytes, filename: str):
     name = filename.lower()
     if name.endswith(".csv") or name.endswith(".txt"):
@@ -162,7 +195,8 @@ def find_series(sheets, today: date | None = None) -> list[dict]:
                 if not cells or sum(1 for d in dates[ri] if d) >= 5:
                     continue
                 label = " ".join(text(row[j]) for j in range(first_col) if text(row[j])) or f"Row {ri + 1}"
-                cands.append({"sheet": sheet, "label": label[:80], "layout": "across", "cells": cells})
+                cands.append({"sheet": sheet, "label": label[:80], "layout": "across", "cells": cells,
+                              "range": (min(cols.values()).isoformat(), max(cols.values()).isoformat())})
 
         # down: columns with >= 5 dates
         for j in range(width):
@@ -181,20 +215,22 @@ def find_series(sheets, today: date | None = None) -> list[dict]:
                     continue
                 above = date_rows[0] - 1
                 head = text(grid[above][k]) if above >= 0 else ""
+                ds = [dates[i][j] for i in date_rows]
                 cands.append({"sheet": sheet, "label": (head or f"Column {k + 1}")[:80], "layout": "down",
-                              "cells": cells})
+                              "cells": cells, "range": (min(ds).isoformat(), max(ds).isoformat())})
 
     wd = re.compile(r"^(mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?$", re.I)
     seen, out = set(), []
     for c in cands:
         if all(wd.match(v) for v in c["cells"].values()):
             continue  # a row/column of weekday names, not a roster
-        key = (c["sheet"], c["label"], tuple(sorted(c["cells"].items())))
+        key = (c["sheet"], c["label"], tuple(sorted(c["cells"].items())), c.get("range"))
         if key in seen:
             continue
         seen.add(key)
         days = sorted(c["cells"])
-        c.update({"id": len(out), "count": len(days), "start": days[0], "end": days[-1]})
+        rs, re_ = c.pop("range", (days[0], days[-1]))
+        c.update({"id": len(out), "count": len(days), "start": min(rs, days[0]), "end": max(re_, days[-1])})
         out.append(c)
         if len(out) >= 400:
             break

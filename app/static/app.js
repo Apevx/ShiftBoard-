@@ -747,6 +747,15 @@ $("#impFile").addEventListener("change", async e => {
   const r = await fetch("/api/import/preview", { method: "POST", body: fd });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) return toast(j.detail || "Couldn't read that file");
+  startImport(j);
+});
+$("#impRead").onclick = async () => {
+  const text = $("#impText").value;
+  if (!text.trim()) return toast("Paste the roster cells first");
+  const j = await api("/api/import/paste", { method: "POST", body: { text, first_date: $("#impFirst").value || null } });
+  startImport(j);
+};
+function startImport(j) {
   IMP = { ...j, map: {} };
   const last = ls.get("importLabel", "");
   const sel = $("#impSeries");
@@ -755,7 +764,8 @@ $("#impFile").addEventListener("change", async e => {
   sel.value = pick.id;
   $("#impStep").hidden = false;
   renderImport();
-});
+  $("#impStep").scrollIntoView({ behavior: "smooth", block: "start" });
+}
 $("#impSeries").addEventListener("change", renderImport);
 function currentSeries() { return IMP.series.find(s => s.id === +$("#impSeries").value); }
 function renderImport() {
@@ -808,7 +818,7 @@ $("#impApply").onclick = async () => {
   const r = await api("/api/import/apply", { method: "POST", body: { ...b, replace, aliases } });
   ls.set("importLabel", currentSeries().label);
   toast(`Imported ${r.assigned} shifts${r.oncall ? ` and ${r.oncall} on-call periods` : ""}`);
-  $("#impStep").hidden = true; IMP = null;
+  $("#impStep").hidden = true; IMP = null; $("#impText").value = "";
   $("#setDlg").close();
   const d = parseYmd(b.start); cur = new Date(d.getFullYear(), d.getMonth(), 1); load();
 };
